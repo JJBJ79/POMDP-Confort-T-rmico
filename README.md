@@ -1,1 +1,1 @@
-# POMDP-Confort-T-rmico
+# POMDP-Confort-Termico
