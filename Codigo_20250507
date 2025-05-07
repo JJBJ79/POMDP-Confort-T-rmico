@@ -681,40 +681,54 @@ def update_belief_with_resample(agente, accion, observacion_real):
         print("[ERROR] Aún hay `EstadoConfortTermico` en `belief.particles`, generando respaldo...")
         particulas_corregidas = [Particula(EstadoConfortTermico.generar_estado_aleatorio()) for _ in range(len(particulas_corregidas))]
 
+    for p in particulas_corregidas:
+        if not isinstance(p.estado, EstadoConfortTermico):
+            print("[WARNING] Estado recibido no es válido. Regenerando respaldo...")
+            p.estado = EstadoConfortTermico.generar_estado_aleatorio()
+
     agente.set_belief(pomdp_py.Particles(particulas_corregidas))
 
     print(f"[DEBUG] Tipos de partículas en `belief.particles` tras actualización: {[type(p) for p in agente.cur_belief.particles]}")
 
+
     for p in particulas_corregidas:
-        p.weight += np.random.uniform(1e-5, 1e-3)  
+        p.estado.ambiente["tdb"] += np.random.uniform(-2.0, 2.0)  
+        p.estado.control["Var"] += np.random.uniform(-0.2, 0.2)  
+        p.pmv += np.random.uniform(-0.5, 0.5)  
 
-    num_nuevas = max(500, int(len(particulas_corregidas) * 0.5))  
-    particulas_adicionales = [
-        Particula(EstadoConfortTermico.generar_estado_aleatorio(), weight=np.random.uniform(1e-3, 5e-2))
-        for _ in range(num_nuevas)  
-    ]
-    particulas_corregidas.extend(particulas_adicionales)
-
-    print(f"[DEBUG] Número total de partículas después del refuerzo adicional: {len(particulas_corregidas)}")
-
-    peso_total = sum(p.weight for p in particulas_corregidas) + 1e-6  
     for p in particulas_corregidas:
-        p.weight /= peso_total  
+        p.weight += np.random.uniform(1e-4, 5e-4)  
 
-    peso_minimo = min(p.weight for p in particulas_corregidas)
-    peso_maximo = max(p.weight for p in particulas_corregidas)
-    print(f"[DEBUG] Pesos ajustados correctamente: min={peso_minimo}, max={peso_maximo}")
+ 
+    pesos = [p.weight for p in particulas_corregidas]
+    print(f"[DEBUG] Rango de pesos: min={min(pesos)}, max={max(pesos)}, promedio={sum(pesos) / len(pesos)}")
+   
+    peso_total = sum(p.weight for p in particulas_corregidas) + 1e-6
+    for p in particulas_corregidas:
+        p.weight = (p.weight ** 0.5) / peso_total  
 
     n_eff = 1.0 / (sum(p.weight ** 2 for p in particulas_corregidas) + 1e-6)
-    print(f"[DEBUG] Número efectivo de partículas después del ajuste: {n_eff}")
+    print(f"[DEBUG] Número efectivo de partículas después de ajuste: {n_eff}")
 
-    if n_eff > len(particulas_corregidas) * 2:  
-        print("[WARNING] `n_eff` es excesivamente alto, ajustando distribución de pesos...")
-        for p in particulas_corregidas:  
-            p.weight += 1e-6  
-        peso_total = sum(p.weight for p in particulas_corregidas)
-        for p in particulas_corregidas:
-            p.weight /= peso_total  
+    if n_eff < len(particulas_corregidas) * 0.3: 
+        print("[WARNING] `n_eff` sigue demasiado bajo, aumentando la diversidad del conjunto...")
+        particulas_adicionales = [
+            Particula(EstadoConfortTermico.generar_estado_aleatorio(), weight=np.random.uniform(1e-3, 5e-2))
+            for _ in range(2000) 
+        ]
+        particulas_corregidas.extend(particulas_adicionales)
+
+    if iteraciones_resampleo >= 5 and n_eff < len(particulas_corregidas) * 0.3:
+        print("[WARNING] `n_eff` sigue decayendo tras varias iteraciones. Aplicando nueva regeneración...")
+        particulas_corregidas = [
+            Particula(EstadoConfortTermico.generar_estado_aleatorio()) for _ in range(len(particulas_corregidas))
+        ]
+        iteraciones_resampleo = 0 
+
+    max_particulas = 50_000  # Establecer un límite más manejable
+    if len(particulas_corregidas) > max_particulas:
+        print(f"[WARNING] Exceso de partículas ({len(particulas_corregidas)}). Reduciendo a {max_particulas}...")
+        particulas_corregidas = particulas_corregidas[:max_particulas]  
 
     agente.set_belief(pomdp_py.Particles(particulas_corregidas))
     print(f"[DEBUG] Creencia corregida con {len(particulas_corregidas)} partículas.")
@@ -870,11 +884,15 @@ def safe_plan_call(planificador, agente):
     print(f"[DEBUG] Acción planificada con éxito: {resultado}")
     return resultado
 
+
 def probar_planificador_con_arbol(problema_confort, planificador, pasos=5):
 
     print("[DEBUG] Tipo de planificador:", type(planificador))
     atributos_planificador = dir(planificador)
     print("[DEBUG] Atributos del planificador:", atributos_planificador)
+
+    if isinstance(planificador, pomdp_py.algorithms.pomcp.POMCP):
+        print("[WARNING] `POMCP` no genera un árbol de búsqueda explícito. Verificando otras estructuras...")
 
     tiene_arbol = hasattr(planificador, 'tree') and planificador.tree is not None
     print(f"[DEBUG] ¿Planificador tiene árbol?: {tiene_arbol}")
@@ -888,12 +906,33 @@ def probar_planificador_con_arbol(problema_confort, planificador, pasos=5):
         print("[ERROR] La política del agente no tiene acciones disponibles.")
         return
 
+    if not isinstance(problema_confort.agente.belief.particles[0].estado, EstadoConfortTermico):
+        print("[WARNING] Estado principal en creencia no es válido. Regenerando respaldo...")
+        problema_confort.agente.set_belief(pomdp_py.Particles(crear_creencia_inicial_en_particulas(num_particulas=2000)))
+
+    estados_unicos = set([str(p.estado) for p in problema_confort.agente.belief.particles])  
+    if len(estados_unicos) < 100:  # Si hay menos de 100 estados únicos, hay poca diversidad
+        print("[WARNING] Partículas están demasiado concentradas en estados repetidos. Aplicando regeneración...")
+        problema_confort.agente.set_belief(crear_creencia_inicial_en_particulas(num_particulas=2000))  # Regenerar más partículas
+
     try:
         planificador.update(problema_confort.agente, AccionConfortTermico(0, 0), ObservacionConfort(25, 22, 0.5, 50, 0.0))
     except Exception as e:
         print(f"[ERROR] Fallo en `planificador.update()`: {e}")
 
+    print(f"[DEBUG] Número de partículas tras `planificador.update()`: {len(problema_confort.agente.belief.particles)}")
+    if len(problema_confort.agente.belief.particles) < 1000:  # Si después de actualizar quedan menos de 1000 partículas
+        print("[WARNING] Excesiva eliminación de partículas tras `update()`. Regenerando conjunto...")
+        problema_confort.agente.set_belief(pomdp_py.Particles(crear_creencia_inicial_en_particulas(num_particulas=5000)))
+
     planificador.plan(problema_confort.agente)
+
+    if hasattr(planificador, "tree"):
+        print("[DEBUG] Estructura del árbol después de la planificación:")
+        if hasattr(planificador.tree, "root") and planificador.tree.root is not None:
+            print(f"[DEBUG] Nodo raíz del árbol: {planificador.tree.root}")
+        else:
+            print("[WARNING] Árbol de planificación está vacío o mal estructurado.")
 
     tiene_arbol = hasattr(planificador, 'tree') and planificador.tree is not None
     print(f"[DEBUG] ¿Planificador tiene árbol después de la planificación?: {tiene_arbol}")
@@ -918,6 +957,11 @@ def probar_planificador_con_arbol(problema_confort, planificador, pasos=5):
         print(f"[DEBUG] Acción seleccionada: {accion}")
 
         try:
+
+            problema_confort.agente.observation_model.ruido_observacion = max(
+                0.2, problema_confort.agente.observation_model.ruido_observacion * 1.5
+            )
+
             observacion_real = problema_confort.agente.observation_model.sample(
                 problema_confort.entorno.estado_inicial, accion
             )
