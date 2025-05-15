@@ -120,22 +120,23 @@ class EstadoConfortTermico(pomdp_py.State):
     def generar_estado_aleatorio(cls):
 
         ambiente = { 
-            "Hr": random.uniform(20, 60),
-            "tdb": random.uniform(15, 30),
-            "Tr": random.uniform(15, 35)
+            "Hr": round(random.uniform(10, 90)),
+            "tdb": round(random.uniform(2, 35)),
+            "Tr": round(random.uniform(10, 40)),
+            "Pa": round(random.uniform(500,5600))
         }
         control = { 
-            "Tt": random.uniform(20, 25),
-            "Var": random.uniform(0.1, 1)
+            "Tt": round(random.uniform(16, 33)),
+            "Var": random.uniform(0, 1)
         }
         persona = { 
-            "M": np.random.normal(1.25, 0.2),  
-            "W": np.random.normal(0.15, 0.05),  
-            "Icl": np.random.normal(0.75, 0.1)  
+            "M": np.clip(np.random.normal(2.5 , 0.2), 0.8 , 4.0),  
+            "W": np.clip(np.random.normal(0.15, 0.05), 0, 0.3),  
+            "Icl": np.clip(np.random.normal(0.1 , 0.05), 0, 0.310)  
         }
         transferencia = { 
-            "hc": np.random.normal(1.25, 0.3),  
-            "Tcl": np.random.normal(30, 5)  
+            "hc": np.clip(np.random.normal(4, 0.3), 2 , 6) , 
+            "Tcl": np.clip(np.random.normal(2,0.5),30, 5)  
         }
 
         return cls(ambiente, control, persona, transferencia)
@@ -153,15 +154,15 @@ class EstadoConfortTermico(pomdp_py.State):
         ))
 
 class Particula(pomdp_py.State):
-    def __init__(self, estado: EstadoConfortTermico, weight=1.0, pmv_deseado=0.0):
+    def __init__(self, estado: EstadoConfortTermico, weight=None, pmv_deseado=0.0):
 
         if not isinstance(estado, EstadoConfortTermico):
             print("[WARNING] Estado inválido en Particula, generando uno nuevo...")
             estado = EstadoConfortTermico.generar_estado_aleatorio()
 
-        if not isinstance(weight, (int, float)) or weight < 0.0:
-            print("[ERROR] Weight no es un número válido. Reiniciando...")
-            weight = 1.0
+        if weight is None or not isinstance(weight, (int, float)) or weight < 0.0:
+            print("[ERROR] Weight no es un número válido. Asignando aleatoriamente...")
+            weight = np.random.uniform(1.0, 2.5)  # 🔹 Asegurar que los pesos iniciales sean más robustos
 
         if not isinstance(pmv_deseado, (int, float)):
             raise ValueError("[ERROR] 'pmv_deseado' debe ser un número válido.")
@@ -175,17 +176,17 @@ class Particula(pomdp_py.State):
         self.transferencia = dict(estado.transferencia)
         self.pmv = estado.pmv
 
-        self.weight = max(weight, 1e-4)  
+        self.weight = max(weight, 0.5)  # 🔹 Asegurar que el peso mínimo sea 0.5
         self.pmv_deseado = pmv_deseado  
 
         self.actualizar_peso()
 
     def actualizar_peso(self):
         diferencia_pmv = abs(self.pmv - self.pmv_deseado)
-        self.weight = max(1e-4, 1.0 - diferencia_pmv / 10.0)  
+        self.weight = max(0.5, 1.0 - diferencia_pmv / 8.0)  # 🔹 Ajuste menos agresivo para evitar pesos bajos
 
-        ruido = np.random.uniform(-0.0025, 0.0025)
-        self.weight = max(1e-4, min(self.weight + ruido, 1.0))  
+        ruido = np.random.uniform(-0.01, 0.01)  # 🔹 Aumentar el ruido para mayor variabilidad sin reducir demasiado el peso
+        self.weight = max(0.5, min(self.weight + ruido, 2.0))  # 🔹 Asegurar que el peso no caiga por debajo de 0.5
 
     def __eq__(self, other):    
         return (isinstance(other, Particula) and 
@@ -244,30 +245,29 @@ class AccionConfortTermico(pomdp_py.Action):
         print("[DEBUG] La acción es válida.")
         return True
 
+
 class ObservacionConfort(pomdp_py.Observation):
-    def __init__(self, tdb, tt, Var, Hr, pmv):
+    def __init__(self, tdb, tt, Var, Hr):
         self.tdb = max(5, min(40, tdb))
         self.tt = max(16, min(33, tt))
         self.Var = max(0, min(1, Var))
         self.Hr = max(10, min(80, Hr))
-        self.pmv = max(-3, min(3, pmv))
 
     def __repr__(self):
         return (f"ObservacionConfort(tdb={self.tdb:.2f}, tt={self.tt:.2f}, Var={self.Var:.2f}, "
-                f"Hr={self.Hr:.2f}, pmv={self.pmv:.2f})")
+                f"Hr={self.Hr:.2f})")
 
     def __eq__(self, other):
         if isinstance(other, ObservacionConfort):
             return (abs(self.tdb - other.tdb) < 1e-6 and
                     abs(self.tt - other.tt) < 1e-6 and
                     abs(self.Var - other.Var) < 1e-6 and
-                    abs(self.Hr - other.Hr) < 1e-6 and
-                    abs(self.pmv - other.pmv) < 1e-6)
+                    abs(self.Hr - other.Hr) < 1e-6)
         return False
 
     def __hash__(self):
         return hash((round(self.tdb, 6), round(self.tt, 6), round(self.Var, 6),
-                     round(self.Hr, 6), round(self.pmv, 6)))
+                     round(self.Hr, 6)))
 
 
 class ModeloDeObservacion(pomdp_py.ObservationModel):
@@ -275,7 +275,7 @@ class ModeloDeObservacion(pomdp_py.ObservationModel):
         if not isinstance(ruido_observacion, (float, int)) or ruido_observacion < 0:
             raise ValueError("[ERROR] 'ruido_observacion' debe ser un número positivo.")
         
-        self.ruido_observacion = ruido_observacion
+        self.ruido_observacion = max(0.2, min(1.0, ruido_observacion * 1.5))  # 🔹 Aumentar ruido de observación
         print(f"[DEBUG] ModeloDeObservacion inicializado con ruido_observacion={self.ruido_observacion}")
 
     def sample(self, estado, accion):
@@ -283,13 +283,12 @@ class ModeloDeObservacion(pomdp_py.ObservationModel):
             if not isinstance(estado, EstadoConfortTermico):
                 raise TypeError("[ERROR] 'estado' debe ser una instancia de EstadoConfortTermico.")
 
-            Tt_valor = max(16, min(33, estado.control.get("Tt", 25) + random.uniform(-self.ruido_observacion, self.ruido_observacion)))
-            tdb_valor = max(5, min(40, estado.ambiente.get("tdb", 25) + random.uniform(-self.ruido_observacion, self.ruido_observacion)))
-            Var_valor = max(0, min(1, estado.control.get("Var", 0.5) + random.uniform(-self.ruido_observacion, self.ruido_observacion)))
-            Hr_valor = max(10, min(80, estado.ambiente.get("Hr", 50) + random.uniform(-self.ruido_observacion, self.ruido_observacion)))
-            pmv_valor = max(-3, min(3, estado.pmv + random.uniform(-self.ruido_observacion, self.ruido_observacion)))
+            Tt_valor = max(16, min(33, estado.control.get("Tt", 25) + random.uniform(-self.ruido_observacion * 2, self.ruido_observacion * 2)))
+            tdb_valor = max(5, min(40, estado.ambiente.get("tdb", 25) + random.uniform(-self.ruido_observacion * 2, self.ruido_observacion * 2)))
+            Var_valor = max(0, min(1, estado.control.get("Var", 0.5) + random.uniform(-self.ruido_observacion * 2, self.ruido_observacion * 2)))
+            Hr_valor = max(10, min(80, estado.ambiente.get("Hr", 50) + random.uniform(-self.ruido_observacion * 2, self.ruido_observacion * 2)))
 
-            observacion = ObservacionConfort(tdb=tdb_valor, tt=Tt_valor, Var=Var_valor, Hr=Hr_valor, pmv=pmv_valor)
+            observacion = ObservacionConfort(tdb=tdb_valor, tt=Tt_valor, Var=Var_valor, Hr=Hr_valor)
             print(f"[DEBUG] Observación generada correctamente: {observacion}")
             return observacion
         except Exception as e:
@@ -304,9 +303,9 @@ class ModeloDeObservacion(pomdp_py.ObservationModel):
                 raise TypeError("[ERROR] 'estado' debe ser una instancia de EstadoConfortTermico.")
 
             probabilidad = 1.0
-            sigma = max(0.1, min(10, self.ruido_observacion))  # 🔹 Asegurar valores estables en sigma
+            sigma = max(1.0, min(15, self.ruido_observacion * 3))  # 🔹 Aumentar incertidumbre en la observación
 
-            for atributo in ["tdb", "tt", "Var", "Hr", "pmv"]:
+            for atributo in ["tdb", "tt", "Var", "Hr"]:
                 valor_obs = getattr(obs, atributo, None)
                 valor_estado = getattr(estado, atributo, None)
                 if valor_obs is None or valor_estado is None:
@@ -324,12 +323,11 @@ class ModeloDeObservacion(pomdp_py.ObservationModel):
     def get_all_observations(self):
         try:
             observaciones = [
-                ObservacionConfort(tdb=tdb, tt=Tt, Var=Var, Hr=Hr, pmv=pmv)
+                ObservacionConfort(tdb=tdb, tt=Tt, Var=Var, Hr=Hr)
                 for Tt in range(16, 34, 4)
                 for tdb in range(5, 41, 5)
                 for Var in [0.1, 0.5, 1.0]
                 for Hr in range(10, 81, 20)
-                for pmv in [-3, 0, 3]
             ]
             print(f"[DEBUG] Se generaron {len(observaciones)} observaciones posibles.")
             return observaciones
@@ -383,7 +381,7 @@ class ModeloDeTransicion(pomdp_py.TransitionModel):
                 tdb=ambiente["tdb"], tr=ambiente["Tr"], vr=control["Var"],
                 rh=ambiente["Hr"], met=persona["M"], clo=persona["Icl"], wme=persona["W"]
             )
-            pmv_nuevo = round(resultado_pmv["pmv"], 2)
+            pmv_nuevo = round(resultado_pmv["pmv"], 1)
 
         except Exception as e:
             print(f"[ERROR] Falló el cálculo de PMV: {e}")
@@ -407,10 +405,10 @@ class ModeloDeRecompensa(pomdp_py.RewardModel):
         self.pmv_deseado = pmv_deseado
 
     def _funcion_recompensa(self, estado, accion):
-        # 🔹 Validar que `estado` sea una instancia válida de `EstadoConfortTermico`
+        
         if estado is None or not isinstance(estado, EstadoConfortTermico):
             print("[WARNING] Estado recibido no es válido. Generando uno nuevo...")
-            estado = EstadoConfortTermico.generar_estado_aleatorio()  # ✅ Generar estado válido
+            estado = EstadoConfortTermico.generar_estado_aleatorio()  
 
         if accion is None:
             print("[WARNING] _funcion_recompensa: Acción es None, asignando acción por defecto y recompensa 0.0.")
@@ -429,9 +427,8 @@ class ModeloDeRecompensa(pomdp_py.RewardModel):
         elif accion.cambio_de_flujo_de_aire == -1 and estado.transferencia.get("hc", 0) <= 0.5:
             recompensa -= 1  
 
-        # **Penalización por desviaciones grandes del PMV**
-        if abs(pmv_actual) > 0.7:  # 🔹 Si el PMV está fuera del rango confortable (-0.5 a 0.5)
-            penalizacion = abs(pmv_actual) * 2  # 🔹 Penalizar más desviaciones grandes
+        if abs(pmv_actual) > 0.7: 
+            penalizacion = abs(pmv_actual) * 2  
             recompensa -= penalizacion
 
         recompensa = max(0.0, recompensa)  
@@ -479,29 +476,29 @@ class ModeloDePolitica(pomdp_py.RolloutPolicy):
         print(f"[DEBUG] Acciones disponibles en la política: {self.acciones}")
         return self.acciones
 
-    def _funcion_recompensa(self, estado, accion):
+    #def _funcion_recompensa(self, estado, accion):
 
-        if estado is None or not isinstance(estado, EstadoConfortTermico):
-            raise ValueError("[ERROR] 'estado' debe ser una instancia válida de EstadoConfortTermico.")
+        #if estado is None or not isinstance(estado, EstadoConfortTermico):
+         #   raise ValueError("[ERROR] 'estado' debe ser una instancia válida de EstadoConfortTermico.")
 
-        if accion is None:
-            print("[WARNING] _funcion_recompensa: Acción es None, asignando recompensa 0.0.")
-            return 0.0 
+        #if accion is None:
+         #   print("[WARNING] _funcion_recompensa: Acción es None, asignando recompensa 0.0.")
+         #   return 0.0 
 
-        pmv_actual = estado.pmv
-        recompensa = max(0.0, 10 - (pmv_actual - self.pmv_deseado) ** 2)  
+        #pmv_actual = estado.pmv
+        #recompensa = max(0.0, 10 - (pmv_actual - self.pmv_deseado) ** 2)  
 
-        if accion.cambio_de_temperatura == 1 and estado.ambiente.get("tdb", 0) >= estado.control.get("Tt", 0):
-            recompensa -= 2
-        elif accion.cambio_de_temperatura == -1 and estado.ambiente.get("tdb", 0) <= estado.control.get("Tt", 0):
-            recompensa -= 2
-        if accion.cambio_de_flujo_de_aire == 1 and estado.transferencia.get("hc", 0) >= 1.0:
-            recompensa -= 1
-        elif accion.cambio_de_flujo_de_aire == -1 and estado.transferencia.get("hc", 0) <= 0.5:
-            recompensa -= 1  
+        #if accion.cambio_de_temperatura == 1 and estado.ambiente.get("tdb", 0) >= estado.control.get("Tt", 0):
+        #    recompensa -= 2
+        #elif accion.cambio_de_temperatura == -1 and estado.ambiente.get("tdb", 0) <= estado.control.get("Tt", 0):
+        #    recompensa -= 2
+        #if accion.cambio_de_flujo_de_aire == 1 and estado.transferencia.get("hc", 0) >= 1.0:
+        #    recompensa -= 1
+        #elif accion.cambio_de_flujo_de_aire == -1 and estado.transferencia.get("hc", 0) <= 0.5:
+        #    recompensa -= 1  
 
-        print(f"[DEBUG] Recompensa calculada: {recompensa}")
-        return recompensa
+        #print(f"[DEBUG] Recompensa calculada: {recompensa}")
+        #return recompensa
 
 class EntornoConfort(pomdp_py.Environment):
     def __init__(self, estados, estado_inicial):
@@ -615,7 +612,7 @@ def crear_creencia_inicial_en_particulas(num_particulas=10000):
             particulas_seleccionadas = random.choices(estados_iniciales, k=num_particulas)
 
         particulas = [
-            Particula(estado=estado, weight=1.0 / num_particulas)
+            Particula(estado=estado, weight=np.random.uniform(0.8, 1.5))  # 🔹 Asegurar pesos iniciales más robustos
             for estado in particulas_seleccionadas
         ]
         print(f"[DEBUG] Partículas creadas con éxito: {len(particulas)} partículas.")
@@ -626,17 +623,17 @@ def crear_creencia_inicial_en_particulas(num_particulas=10000):
         if total_weight == 0:
             print("[ERROR] Todos los pesos son cero, reajustando...")
             for p in belief.particles:
-                p.weight = 1.0 / len(belief.particles)  
+                p.weight = np.random.uniform(0.8, 1.5)  # 🔹 Evitar pesos insignificantes  
         else:
             for p in belief.particles:
-                p.weight /= total_weight 
+                p.weight = max(0.5, p.weight / total_weight)  # 🔹 Asegurar que ningún peso sea menor a 0.5
 
         num_efectivo = 1.0 / (sum(p.weight ** 2 for p in belief.particles) + 1e-6)
         if num_efectivo < len(belief.particles) * 0.5:
             print("[DEBUG] Resampling activado - Número efectivo de partículas:", num_efectivo)
-            belief.particles = random.choices(belief.particles, weights=[p.weight for p in belief.particles], k=len(belief.particles))
+            belief = pomdp_py.Particles(random.choices(belief.particles, weights=[p.weight for p in belief.particles], k=len(belief.particles)))  # 🔹 Crear nueva instancia
             for p in belief.particles:
-                p.weight = 1.0 / len(belief.particles) 
+                p.weight = max(0.5, np.random.uniform(0.8, 1.5))  # 🔹 Evitar pesos bajos tras el resampleo
 
         print("[DEBUG] Creencia inicial generada con éxito:", belief)
         return belief
@@ -650,8 +647,6 @@ def update_belief_with_resample(agente, accion, observacion_real):
     global iteraciones_resampleo
     if "iteraciones_resampleo" not in globals():
         iteraciones_resampleo = 0  
-
-    factor_actualizacion = 1.0  
 
     if not hasattr(agente, "policy") or not hasattr(agente, "cur_belief"):
         print("[ERROR] El agente no tiene una política o creencia válida.")
@@ -690,45 +685,66 @@ def update_belief_with_resample(agente, accion, observacion_real):
 
     print(f"[DEBUG] Tipos de partículas en `belief.particles` tras actualización: {[type(p) for p in agente.cur_belief.particles]}")
 
+    for p in particulas_corregidas:
+        p.estado.ambiente["tdb"] += np.random.uniform(-15.0, 15)
+        p.estado.control["Var"] += np.random.uniform(-3, 3)
+        p.estado.persona["Icl"] += np.random.uniform(-2, 2)
 
     for p in particulas_corregidas:
-        p.estado.ambiente["tdb"] += np.random.uniform(-2.0, 2.0)  
-        p.estado.control["Var"] += np.random.uniform(-0.2, 0.2)  
-        p.pmv += np.random.uniform(-0.5, 0.5)  
+        p.weight += np.random.uniform(0.05, 0.1)  # 🔹 Asegurar que los pesos no sean insignificantes  
 
-    for p in particulas_corregidas:
-        p.weight += np.random.uniform(1e-4, 5e-4)  
-
- 
     pesos = [p.weight for p in particulas_corregidas]
     print(f"[DEBUG] Rango de pesos: min={min(pesos)}, max={max(pesos)}, promedio={sum(pesos) / len(pesos)}")
-   
+
+    pesos_antes = [p.weight for p in particulas_corregidas]
+    print(f"[DEBUG] Rango de pesos antes del resampleo: min={min(pesos_antes)}, max={max(pesos_antes)}, promedio={sum(pesos_antes) / len(pesos_antes)}")
+
     peso_total = sum(p.weight for p in particulas_corregidas) + 1e-6
+    max_peso = max(p.weight for p in particulas_corregidas)
     for p in particulas_corregidas:
-        p.weight = (p.weight ** 0.5) / peso_total  
+        p.weight = max(10, ((p.weight / max_peso) ** 0.6 + 2) / peso_total) 
 
     n_eff = 1.0 / (sum(p.weight ** 2 for p in particulas_corregidas) + 1e-6)
     print(f"[DEBUG] Número efectivo de partículas después de ajuste: {n_eff}")
 
-    if n_eff < len(particulas_corregidas) * 0.3: 
-        print("[WARNING] `n_eff` sigue demasiado bajo, aumentando la diversidad del conjunto...")
-        particulas_adicionales = [
-            Particula(EstadoConfortTermico.generar_estado_aleatorio(), weight=np.random.uniform(1e-3, 5e-2))
-            for _ in range(2000) 
-        ]
-        particulas_corregidas.extend(particulas_adicionales)
+    # 🔹 Si las partículas están demasiado concentradas en estados repetidos, aplicar regeneración
+    print("[WARNING] Partículas están demasiado concentradas en estados repetidos. Aplicando regeneración...")
+    
+    particulas_nuevas = [
+        Particula(EstadoConfortTermico.generar_estado_aleatorio(), weight=np.random.uniform(10, 20)) 
+        for _ in range(3000)
+    ]
+
+    for p in particulas_nuevas:
+        if np.random.rand() < 0.5:  # 🔹 Aleatoriza la asignación de estado para mayor diversidad
+            p.estado.ambiente["tdb"] += np.random.uniform(-10.0, 10.0)
+
+    particulas_corregidas.extend(particulas_nuevas)
+
+    if len(particulas_corregidas) < 5000:
+        print("[WARNING] Eliminación excesiva de partículas. Reintroduciendo nuevas partículas...")
+        particulas_corregidas.extend([
+            Particula(EstadoConfortTermico.generar_estado_aleatorio(), weight=np.random.uniform(1.0, 2.0))  # 🔹 Evitar pesos bajos
+            for _ in range(2000)
+        ])
+
+    if n_eff < len(particulas_corregidas) * 0.3:
+        print("[WARNING] `n_eff` crítico. Ajustando pesos en lugar de eliminar partículas...")
+        for p in particulas_corregidas:
+            p.weight = max(10, p.weight * 2)  
 
     if iteraciones_resampleo >= 5 and n_eff < len(particulas_corregidas) * 0.3:
-        print("[WARNING] `n_eff` sigue decayendo tras varias iteraciones. Aplicando nueva regeneración...")
-        particulas_corregidas = [
-            Particula(EstadoConfortTermico.generar_estado_aleatorio()) for _ in range(len(particulas_corregidas))
-        ]
-        iteraciones_resampleo = 0 
+        print("[WARNING] Revisión más suave en eliminación de partículas...")
+        particulas_corregidas.extend([
+            Particula(EstadoConfortTermico.generar_estado_aleatorio(), weight=np.random.uniform(1.0, 2.0))  # 🔹 Evitar pesos bajos
+            for _ in range(3000)
+        ])
+        iteraciones_resampleo = 0  
 
-    max_particulas = 50_000  # Establecer un límite más manejable
+    max_particulas = 20000
     if len(particulas_corregidas) > max_particulas:
-        print(f"[WARNING] Exceso de partículas ({len(particulas_corregidas)}). Reduciendo a {max_particulas}...")
-        particulas_corregidas = particulas_corregidas[:max_particulas]  
+        print(f"[WARNING] Exceso de partículas ({len(particulas_corregidas)}), reduciendo más lentamente...")
+        particulas_corregidas = particulas_corregidas[:int(max_particulas * 1.05)]  # 🔹 Mantener un margen antes de la eliminación total  
 
     agente.set_belief(pomdp_py.Particles(particulas_corregidas))
     print(f"[DEBUG] Creencia corregida con {len(particulas_corregidas)} partículas.")
@@ -737,7 +753,6 @@ def prueba_basica():
     print("[INFO] Ejecutando prueba básica del sistema POMDP.")
 
     try:
-
         ambiente = {"Hr": 38.0, "Pa": 93.9, "tdb": 24, "Tr": 25.3}
         control = {"Tt": 20, "Var": 0.75}
         persona = {"M": 1.05, "W": 0.18, "Icl": 1.86}
@@ -757,8 +772,18 @@ def prueba_basica():
 
         try:
             print("[TEST] Probando crear_creencia_inicial_en_particulas...")
-            creencia = crear_creencia_inicial_en_particulas(num_particulas=10)
+            creencia = crear_creencia_inicial_en_particulas(num_particulas=1000)  # 🔹 Asegurar suficiente diversidad
             print("[TEST] Creencia inicial creada con éxito:", creencia)
+
+            # 🔹 Verificar pesos de las partículas
+            pesos = [p.weight for p in creencia.particles]
+            print(f"[DEBUG] Rango de pesos en creencia inicial: min={min(pesos)}, max={max(pesos)}, promedio={sum(pesos) / len(pesos)}")
+
+            if min(pesos) < 0.5:
+                print("[WARNING] Algunos pesos son demasiado bajos. Ajustando...")
+                for p in creencia.particles:
+                    p.weight = max(0.5, p.weight)  # 🔹 Asegurar que ningún peso sea menor a 0.5
+
         except Exception as e:
             print(f"[TEST ERROR] La prueba de creencia inicial falló: {type(e).__name__}: {e}")
             return  
@@ -771,7 +796,7 @@ def prueba_basica():
             pouct = pomdp_py.POUCT(
                 max_depth=5,
                 discount_factor=0.95,
-                num_sims=10, 
+                num_sims=50,  # 🔹 Aumentar número de simulaciones para mejorar estabilidad
                 exploration_const=1.0,
                 rollout_policy=ModeloDePolitica()
             )
@@ -837,7 +862,7 @@ def safe_plan_call(planificador, agente):
 
     if not agente.cur_belief.particles:
         print("[WARNING] `belief.particles` está vacío, generando partículas de respaldo...")
-        agente.set_belief(pomdp_py.Particles([Particula(EstadoConfortTermico.generar_estado_aleatorio())]))
+        agente.set_belief(pomdp_py.Particles([Particula(EstadoConfortTermico.generar_estado_aleatorio(), weight=1.0)]))
 
     particulas_seguras = [p for p in agente.cur_belief.particles if isinstance(p, Particula)]  
 
@@ -846,7 +871,7 @@ def safe_plan_call(planificador, agente):
         particulas_seguras.append(Particula(EstadoConfortTermico.generar_estado_aleatorio(), weight=1.0))
 
     for p in particulas_seguras:
-        p.weight = max(min(p.weight, 0.1), 1e-4)  
+        p.weight = max(min(p.weight, 1.5), 0.5)  # 🔹 Asegurar que los pesos no sean insignificantes  
 
     total_weight = sum(p.weight for p in particulas_seguras) if particulas_seguras else 1.0  
     for p in particulas_seguras:
@@ -860,12 +885,12 @@ def safe_plan_call(planificador, agente):
 
     pesos_validos = [p.weight for p in agente.cur_belief.particles if isinstance(p, Particula)]
     if pesos_validos:
-        peso_minimo = np.percentile(pesos_validos, 5)
-        peso_maximo = np.percentile(pesos_validos, 95)
+        peso_minimo = max(0.5, np.percentile(pesos_validos, 5))  # 🔹 Evitar valores insignificantes
+        peso_maximo = min(1.5, np.percentile(pesos_validos, 95))  # 🔹 Limitar valores extremos
     else:
         print("[WARNING] No hay partículas válidas. Usando pesos por defecto.")
-        peso_minimo = 1e-4
-        peso_maximo = 0.1
+        peso_minimo = 0.5
+        peso_maximo = 1.5
 
     for p in agente.cur_belief.particles:
         p.weight = max(p.weight, peso_minimo)  
@@ -910,42 +935,25 @@ def probar_planificador_con_arbol(problema_confort, planificador, pasos=5):
         print("[WARNING] Estado principal en creencia no es válido. Regenerando respaldo...")
         problema_confort.agente.set_belief(pomdp_py.Particles(crear_creencia_inicial_en_particulas(num_particulas=2000)))
 
-    estados_unicos = set([str(p.estado) for p in problema_confort.agente.belief.particles])  
-    if len(estados_unicos) < 100:  # Si hay menos de 100 estados únicos, hay poca diversidad
-        print("[WARNING] Partículas están demasiado concentradas en estados repetidos. Aplicando regeneración...")
-        problema_confort.agente.set_belief(crear_creencia_inicial_en_particulas(num_particulas=2000))  # Regenerar más partículas
+    # 🔹 Verificar pesos de las partículas después de la inicialización
+    pesos = [p.weight for p in problema_confort.agente.belief.particles]
+    print(f"[DEBUG] Rango de pesos en creencia inicial: min={min(pesos)}, max={max(pesos)}, promedio={sum(pesos) / len(pesos)}")
 
-    try:
-        planificador.update(problema_confort.agente, AccionConfortTermico(0, 0), ObservacionConfort(25, 22, 0.5, 50, 0.0))
-    except Exception as e:
-        print(f"[ERROR] Fallo en `planificador.update()`: {e}")
-
-    print(f"[DEBUG] Número de partículas tras `planificador.update()`: {len(problema_confort.agente.belief.particles)}")
-    if len(problema_confort.agente.belief.particles) < 1000:  # Si después de actualizar quedan menos de 1000 partículas
-        print("[WARNING] Excesiva eliminación de partículas tras `update()`. Regenerando conjunto...")
-        problema_confort.agente.set_belief(pomdp_py.Particles(crear_creencia_inicial_en_particulas(num_particulas=5000)))
+    if min(pesos) < 0.5:
+        print("[WARNING] Algunos pesos son demasiado bajos. Ajustando...")
+        for p in problema_confort.agente.belief.particles:
+            p.weight = max(0.5, p.weight)  # 🔹 Asegurar que ningún peso sea menor a 0.5
 
     planificador.plan(problema_confort.agente)
 
+    # 🔹 Verificar la estructura del árbol antes de inspeccionar `VNode`
     if hasattr(planificador, "tree"):
-        print("[DEBUG] Estructura del árbol después de la planificación:")
+        print(f"[DEBUG] Estructura del árbol en `POMCP`: {planificador.tree}")
         if hasattr(planificador.tree, "root") and planificador.tree.root is not None:
             print(f"[DEBUG] Nodo raíz del árbol: {planificador.tree.root}")
+            print(f"[DEBUG] Atributos disponibles en el nodo raíz: {dir(planificador.tree.root)}")
         else:
-            print("[WARNING] Árbol de planificación está vacío o mal estructurado.")
-
-    tiene_arbol = hasattr(planificador, 'tree') and planificador.tree is not None
-    print(f"[DEBUG] ¿Planificador tiene árbol después de la planificación?: {tiene_arbol}")
-
-    debugger = None
-    if tiene_arbol and hasattr(planificador.tree, "root"):
-        try:
-            debugger = TreeDebugger(planificador.tree)
-            print("[DEBUG] TreeDebugger creado para visualizar el árbol.")
-        except Exception as e:
-            print(f"[WARNING] Error al inicializar TreeDebugger: {e}")
-    else:
-        print("[WARNING] El planificador no tiene árbol o nodos válidos. No se usará debugger.")
+            print("[WARNING] `POMCP` no tiene un nodo raíz explícito. Verificando estructura del árbol...")
 
     accion = safe_plan_call(planificador, problema_confort.agente)
     if accion is None:
@@ -957,19 +965,9 @@ def probar_planificador_con_arbol(problema_confort, planificador, pasos=5):
         print(f"[DEBUG] Acción seleccionada: {accion}")
 
         try:
-
-            problema_confort.agente.observation_model.ruido_observacion = max(
-                0.2, problema_confort.agente.observation_model.ruido_observacion * 1.5
-            )
-
             observacion_real = problema_confort.agente.observation_model.sample(
                 problema_confort.entorno.estado_inicial, accion
             )
-            if observacion_real is None:
-                print("[WARNING] Observación real es None, generando respaldo...")
-                observacion_real = problema_confort.agente.observation_model.sample(
-                    problema_confort.entorno.estado_inicial, AccionConfortTermico(0, 0)
-                )
             print(f"[DEBUG] Observación generada: {observacion_real}")
         except Exception as e:
             print(f"[ERROR] Fallo al generar observación: {e}")
@@ -982,17 +980,14 @@ def probar_planificador_con_arbol(problema_confort, planificador, pasos=5):
             print(f"[ERROR] Fallo en la actualización de creencia o planificador: {e}")
             continue
 
+        # 🔹 Verificar pesos después de la actualización
+        pesos_actualizados = [p.weight for p in problema_confort.agente.belief.particles]
+        print(f"[DEBUG] Rango de pesos después de actualización: min={min(pesos_actualizados)}, max={max(pesos_actualizados)}, promedio={sum(pesos_actualizados) / len(pesos_actualizados)}")
+
         accion = safe_plan_call(planificador, problema_confort.agente)
         if accion is None:
             print("[WARNING] safe_plan_call devolvió None; se asigna acción por defecto.")
             accion = AccionConfortTermico(cambio_de_temperatura=0, cambio_de_flujo_de_aire=0)
-
-        if debugger:
-            try:
-                debugger.display()
-                print("[DEBUG] Visualizando el árbol con debugger.")
-            except Exception as e:
-                print(f"[WARNING] Error al mostrar el árbol con debugger: {e}")
 
         print(f"[DEBUG] Finalizado el paso {i+1}")
 
@@ -1037,13 +1032,22 @@ def main():
         particulas_validas = [p for p in confort.agente.belief.particles if isinstance(p, Particula)]
         if len(particulas_validas) < 100:
             print("[WARNING] Creencia demasiado degradada, re-inicializando partículas.")
-            confort.agente.set_belief(crear_creencia_inicial_en_particulas(num_particulas=1000))
+            confort.agente.set_belief(crear_creencia_inicial_en_particulas(num_particulas=2000))
+
+    # 🔹 Verificar pesos de las partículas después de la inicialización
+    pesos = [p.weight for p in confort.agente.belief.particles]
+    print(f"[DEBUG] Rango de pesos en creencia inicial: min={min(pesos)}, max={max(pesos)}, promedio={sum(pesos) / len(pesos)}")
+
+    if min(pesos) < 0.5:
+        print("[WARNING] Algunos pesos son demasiado bajos. Ajustando...")
+        for p in confort.agente.belief.particles:
+            p.weight = max(0.5, p.weight)  # 🔹 Asegurar que ningún peso sea menor a 0.5
 
     planificadores = {
         "POUCT": pomdp_py.POUCT(
             max_depth=20,
             discount_factor=0.95,
-            num_sims=5000, 
+            num_sims=5000,
             exploration_const=1.2,
             rollout_policy=confort.agente.policy
         ),
@@ -1079,12 +1083,15 @@ if __name__ == "__main__":
         reward_model = ModeloDeRecompensa(pmv_deseado=0.5)
 
         belief = pomdp_py.Particles([
-            EstadoConfortTermico(
-                ambiente={"Hr": 38.0, "Pa": 93.9, "tdb": 24.1, "Tr": 25.3},
-                control={"Tt": 20.2, "Var": 0.75},
-                persona={"M": 1.05, "W": 0.18, "Icl": 1.86},
-                transferencia={"hc": 0.92, "Tcl": 22.4},
-                pmv=0.5
+            Particula(
+                estado=EstadoConfortTermico(
+                    ambiente={"Hr": 38.0, "Pa": 93.9, "tdb": 24.1, "Tr": 25.3},
+                    control={"Tt": 20.2, "Var": 0.75},
+                    persona={"M": 1.05, "W": 0.18, "Icl": 1.86},
+                    transferencia={"hc": 0.92, "Tcl": 22.4},
+                    pmv=0.5
+                ),
+                weight=np.random.uniform(0.8, 1.5)  # 🔹 Evitar pesos bajos
             ) for _ in range(5000)
         ])
 
