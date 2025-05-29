@@ -1,4 +1,4 @@
-
+#Confort Termico c/POMDP
 import pomdp_py
 from pomdp_py.utils import TreeDebugger
 from pomdp_py import Particles
@@ -49,7 +49,6 @@ def setup_logging():
 setup_logging()
 
 
-
 class EstadoConfortTermico(pomdp_py.State):
     def __init__(self, ambiente, control, persona, transferencia, pmv=None):
         super().__init__()
@@ -64,39 +63,38 @@ class EstadoConfortTermico(pomdp_py.State):
         self.pmv = pmv if pmv is not None else self.calcular_pmv()
 
     def calcular_pmv(self):
-        try:
-            tdb = np.clip(self.ambiente.get("tdb", 25), 10, 30)
-            tr = np.clip(self.ambiente.get("Tr", tdb), 10, 40)
-            rh = np.clip(self.ambiente.get("HR", self.ambiente.get("Hr", 50)), 20, 90)
-            met = np.clip(self.persona.get("M", 1.2), 0.8, 4)
-            clo = np.clip(self.persona.get("Icl", 0.8), 0, 2)
-            wme = np.clip(self.persona.get("W", 0.0), 0, 0.1)
-            vr = np.clip(self.control.get("vr", 0.1), 0, 1)
-
-            logging.info(f"DEBUG: calcular_pmv - tdb: {tdb}, tr: {tr}, rh: {rh}, met: {met}, clo: {clo}, wme: {wme}, vr: {vr}")
-
-            resultado = pmv_ppd_iso(tdb=tdb, tr=tr, vr=vr, rh=rh, met=met, clo=clo, wme=wme)
-
+        while True:
             try:
+                tdb = round(random.uniform(19, 28), 1)
+                tr = round(random.uniform(19, 33), 1)
+                rh = round(random.uniform(35, 65), 1)
+                met = round(random.uniform(1.1, 1.5), 2)
+                clo = round(random.uniform(0.85, 1.2), 2)
+                wme = round(random.uniform(0, 0.2), 2)
+                vr = round(random.uniform(0.6, 1.5), 2)
+
+                if (tdb < 20 or tr < 20) and met >= 1.5:
+                    continue  
+                if clo <= 0.75 and met >= 1.5:
+                    continue  
+                if vr > 1.5 and tdb < 20:
+                    continue 
+                if rh >= 65 and vr < 0.6:
+                    continue  
+
+                resultado = pmv_ppd_iso(tdb=tdb, tr=tr, vr=vr, rh=rh, met=met, clo=clo, wme=wme)
                 pmv_value = getattr(resultado, "pmv", None)
-            except AttributeError:
-                logging.error(f"ERROR: pmv_ppd_iso devolvió un objeto inesperado: {resultado}")
-                pmv_value = random.uniform(-0.5, 0.5)
 
-            if pmv_value is None or (isinstance(pmv_value, float) and np.isnan(pmv_value)):
-                logging.error("ERROR: pmv_ppd_iso devolvió NaN, usando valor aleatorio.")
-                pmv_value = random.uniform(-0.5, 0.5)
+                if pmv_value is not None and not np.isnan(pmv_value):
+                    logging.info(f"DEBUG: PMV válido obtenido: {pmv_value}")
+                    return pmv_value
 
-            if abs(pmv_value) < 1e-6:
-                logging.info("DEBUG: PMV calculado es casi 0, se ajusta para introducir variabilidad.")
-                pmv_value = random.uniform(-0.5, 0.5)
+                logging.warning(f"WARNING: pmv_ppd_iso devolvió NaN, descartando cálculo y generando nuevos parámetros.")
 
-            logging.info(f"DEBUG: Resultado de pmv_ppd_iso: PMV final: {pmv_value}")
-            return pmv_value
+            except Exception as e:
+                logging.error(f"ERROR: Fallo en calcular_pmv. Excepción: {e}")
+                continue
 
-        except Exception as e:
-            logging.error(f"[ERROR] Falló el cálculo de PMV con datos: {self.ambiente}, {self.control}, {self.persona}. Excepción: {e}")
-            return random.uniform(-0.5, 0.5)
 
     @classmethod
     def generar_estado_aleatorio(cls):
@@ -124,12 +122,21 @@ class EstadoConfortTermico(pomdp_py.State):
         return cls(ambiente=ambiente, control=control, persona=persona, transferencia=transferencia)
 
     def simular_observacion(self):
+        tdb_base = self.ambiente.get("tdb", 25)
+        Tt_base = self.control.get("Tt", 25)
+        vr_base = self.control.get("vr", 0.1)
+        Hr_base = self.ambiente.get("Hr", 50)
+    
+        tdb_noise = np.random.normal(0, 0.5)  
+        Tt_noise = np.random.normal(0, 0.5)   
+        vr_noise = np.random.normal(0, 0.1) 
+        Hr_noise = np.random.normal(0, 1.0)  
 
         obs = {
-            "tdb": self.ambiente.get("tdb", 25),
-            "Tt": self.control.get("Tt", 25), 
-            "Vr": self.control.get("vr", 0.1),
-            "Hr": self.ambiente.get("Hr", 50)
+            "tdb": np.clip(tdb_base + tdb_noise, 15, 30),
+            "Tt": np.clip(Tt_base + Tt_noise, 15, 40),
+            "Vr": np.clip(vr_base + vr_noise, 0, 2.0),
+            "Hr": np.clip(Hr_base + Hr_noise, 20, 90)
         }
     
         logging.info(f"[DEBUG] Observación simulada generada: {obs}")
@@ -981,6 +988,37 @@ def observacion_a_vector(observacion):
         raise TypeError("Tipo de observacion no soportado")
 
 
+
+def roughen_particles (particulas, sigma_factor=0.8, jitter_min=0.1):
+    
+    for p in particulas:
+        noise_tdb = np.random.normal(0, max(sigma_factor, jitter_min))
+        noise_Tr = np.random.normal(0, max(sigma_factor, jitter_min))
+        noise_vr = np.random.normal(0, max(sigma_factor, jitter_min))
+        noise_Icl = np.random.normal(0, max(sigma_factor / 2, jitter_min / 2))
+        noise_M = np.random.normal(0, max(sigma_factor / 2, jitter_min / 2))
+        
+        p.estado.ambiente["tdb"] += noise_tdb
+        p.estado.ambiente["Tr"] += noise_Tr
+        if "vr" in p.estado.control:
+            p.estado.control["vr"] += noise_vr
+        if "Icl" in p.estado.persona:
+            p.estado.persona["Icl"] += noise_Icl
+        if "M" in p.estado.persona:
+            p.estado.persona["M"] += noise_M
+    return particulas
+
+def perturb_weights(particulas, min_factor=0.95, max_factor=1.05):
+    
+    for p in particulas:
+        p.weight *= np.random.uniform(min_factor, max_factor)
+
+    total_weight = sum(p.weight for p in particulas) + 1e-6
+    for p in particulas:
+        p.weight /= total_weight
+
+    return particulas
+
 def update_belief_with_resample(agente, accion, observacion_real):
     global iteraciones_resampleo
     if "iteraciones_resampleo" not in globals():
@@ -988,14 +1026,6 @@ def update_belief_with_resample(agente, accion, observacion_real):
 
     if not hasattr(agente, "policy") or not hasattr(agente, "cur_belief"):
         print("[ERROR] El agente no tiene una política o creencia válida.")
-        return
-
-    try:
-        acciones_disponibles = agente.policy.get_all_actions()
-        if not acciones_disponibles:
-            raise ValueError("[ERROR] La política del agente no tiene acciones disponibles.")
-    except Exception as e:
-        print(f"[WARNING] Fallo al obtener acciones de la política: {e}")
         return
 
     agente.RS_resample = RS_resample
@@ -1006,23 +1036,30 @@ def update_belief_with_resample(agente, accion, observacion_real):
     ]
     particulas_corregidas = [p for p in particulas_corregidas if isinstance(p, Particula)]
 
-    for p in particulas_corregidas:
-        if not isinstance(p.estado, EstadoConfortTermico):
-            p.estado = EstadoConfortTermico.generar_estado_aleatorio()
-        if np.isnan(p.estado.pmv):
-            print("[WARNING] pmv es NaN en una partícula, reemplazándolo por 0.0")
-            p.estado.pmv = 0.0
+    particulas_validas = [p for p in particulas_corregidas if not np.isnan(p.estado.pmv)]
+    cantidad_faltante = len(particulas_corregidas) - len(particulas_validas)
+    if cantidad_faltante > 0:
+        logging.warning(f"[WARNING] {cantidad_faltante} partículas con NaN eliminadas y reemplazadas.")
 
-    agente.set_belief(pomdp_py.Particles(particulas_corregidas))
+    nuevas_particulas = []
+    while len(nuevas_particulas) < cantidad_faltante:
+        nueva_particula = Particula(EstadoConfortTermico.generar_estado_aleatorio())
+        if not np.isnan(nueva_particula.estado.calcular_pmv()):
+            nuevas_particulas.append(nueva_particula)
+    logging.info(f"[DEBUG] Partículas válidas generadas: {len(nuevas_particulas)}")
+    particulas_finales = particulas_validas + nuevas_particulas
 
-  
+    particulas_finales = roughen_particles(particulas_finales)
+    agente.set_belief(pomdp_py.Particles(particulas_finales))
+    logging.info(f"[DEBUG] Creencia final re-sampleada con {len(particulas_finales)} partículas antes del resampleo.")
+
+    base_ruido_obs = 0.15
+    umbral_obs = 0.5
     diffs = []
-    for i, p in enumerate(particulas_corregidas):
-        obs_sim = p.estado.simular_observacion()
-       
-        vec_sim = observacion_a_vector(obs_sim)
+    for i, p in enumerate(particulas_finales):
+        obs_sim = p.estado.simular_observacion()         
+        vec_sim = observacion_a_vector(obs_sim) 
         vec_real = observacion_a_vector(observacion_real)
-   
         if i == 0:
             logging.info(f"[DEBUG] Observación simulada (diccionario) de la primera partícula: {obs_sim}")
             logging.info(f"[DEBUG] Observación simulada convertida a vector: {vec_sim}")
@@ -1030,134 +1067,59 @@ def update_belief_with_resample(agente, accion, observacion_real):
             logging.info(f"[DEBUG] Observación real convertida a vector: {vec_real}")
         diff = np.linalg.norm(vec_sim - vec_real)
         diffs.append(diff)
-
- 
     var_diff = np.var(diffs)
-    umbral_obs = 0.5       
-    base_ruido_obs = 0.15   
-
-    if var_diff < 1e-6: 
+    if var_diff < 1e-6:
         ruido_observacion_ajustado = base_ruido_obs
     elif var_diff < umbral_obs:
         ruido_observacion_ajustado = base_ruido_obs * (umbral_obs / (var_diff + 1e-6))
     else:
         ruido_observacion_ajustado = base_ruido_obs
-
-    logging.info(f"[DEBUG] Varianza de diferencias observacionales: {var_diff}, ruido observacion ajustado: {ruido_observacion_ajustado}")
+    logging.info(f"[DEBUG] Varianza de diferencias observadas: {var_diff}, ruido observacion ajustado: {ruido_observacion_ajustado}")
 
     modelo_obs = ModeloDeObservacion(ruido_observacion=ruido_observacion_ajustado)
-    for p in particulas_corregidas:
+    for idx, p in enumerate(particulas_finales):
         likelihood = modelo_obs.probability(observacion_real, p.estado, accion)
         p.weight = likelihood
+        logging.debug(f"[DEBUG] Probabilidad (likelihood) de la partícula {idx}: {likelihood}")
 
-    particulas_corregidas = [p for p in particulas_corregidas if not np.isnan(p.estado.pmv)]
     epsilon = 1e-6
-    peso_total = sum(p.weight for p in particulas_corregidas) + epsilon
-    if peso_total < 1e-3:
-        print("[ERROR] Los pesos son demasiado bajos antes de re-muestreo. Ajustando...")
-        for p in particulas_corregidas:
-            p.weight += np.random.uniform(0.01, 0.1)
-        peso_total = sum(p.weight for p in particulas_corregidas) + epsilon
-    for p in particulas_corregidas:
-        p.weight = p.weight / peso_total
+    n_eff = 1.0 / (sum(p.weight**2 for p in particulas_finales) + epsilon)
+    logging.info(f"[DEBUG] n_eff calculado antes del re-muestreo: {n_eff}")
 
-    n_eff = 1.0 / (sum(p.weight**2 for p in particulas_corregidas) + epsilon)
-    print(f"[DEBUG] n_eff calculado antes del re-muestreo: {n_eff}")
+    if n_eff < max(500, len(particulas_finales) * 0.5):
+        logging.info("[DEBUG] n_eff crítico. Aplicando resampleo...")
+        particulas_finales = update_particles(particulas_finales, n_eff_threshold=0.5 * len(particulas_finales))
 
-    particulas_corregidas = update_particles(particulas_corregidas, n_eff_threshold=0.5 * len(particulas_corregidas))
-    n_eff = calculate_n_eff(particulas_corregidas)
-    print(f"[DEBUG] n_eff tras update_particles: {n_eff}")
+    n_eff = calculate_n_eff(particulas_finales)
+    logging.info(f"[DEBUG] n_eff tras update_particles: {n_eff}")
 
-    if n_eff < max(150, len(particulas_corregidas) * 0.7):
-        print("[DEBUG] n_eff crítico. Generando nuevas partículas aleatorias...")
-        num_nuevas = 1000
-        new_particles = [
-            Particula(EstadoConfortTermico.generar_estado_aleatorio(), weight=np.random.uniform(10, 20))
-            for _ in range(num_nuevas)
-        ]
-        particulas_corregidas.extend(new_particles)
-
-    W_total = sum(p.weight for p in particulas_corregidas) + epsilon
-    for p in particulas_corregidas:
-        p.weight = p.weight / W_total
-
-    for p in particulas_corregidas:
-        p.weight *= np.random.uniform(0.8, 1.2) if n_eff < 700 else np.random.uniform(0.95, 1.05)
+    particulas_finales = perturb_weights(particulas_finales)
 
     desired_N = 1000
-    if len(particulas_corregidas) < desired_N:
-        faltantes = desired_N - len(particulas_corregidas)
-        print(f"[DEBUG] Faltan {faltantes} partículas, generando partículas nuevas.")
+    if len(particulas_finales) < desired_N:
+        faltantes = desired_N - len(particulas_finales)
+        logging.info(f"[DEBUG] Faltan {faltantes} partículas, generando partículas nuevas.")
         nuevas_particulas = [
             Particula(EstadoConfortTermico.generar_estado_aleatorio(), weight=1.0)
             for _ in range(faltantes)
         ]
-        particulas_corregidas.extend(nuevas_particulas)
-        tot = sum(p.weight for p in particulas_corregidas) + epsilon
-        for p in particulas_corregidas:
-            p.weight = p.weight / tot
+        particulas_finales.extend(nuevas_particulas)
+        total = sum(p.weight for p in particulas_finales) + epsilon
+        for p in particulas_finales:
+            p.weight /= total
 
-    final_particles = RS_resample(desired_N, [p.weight for p in particulas_corregidas], particulas_corregidas)
+    final_particles = RS_resample(desired_N, [p.weight for p in particulas_finales], particulas_finales)
     for p in final_particles:
         p.weight = 1.0 / desired_N
 
-    tdb_values = [p.estado.ambiente.get("tdb", 25) for p in final_particles]
-    variance_tdb = np.var(tdb_values)
-    umbral_minimo = 1.0              
-    base_sigma_ambiente = 40.0        
-    if variance_tdb < umbral_minimo:
-        sigma_ambiente = base_sigma_ambiente * (umbral_minimo / (variance_tdb + epsilon))
-    else:
-        sigma_ambiente = base_sigma_ambiente
+    logging.info(f"[DEBUG] Creencia final re-sampleada a {desired_N} partículas.")
 
-
-    vr_values = [p.estado.control.get("vr", 0.1) for p in final_particles if "vr" in p.estado.control]
-    variance_vr = np.var(vr_values)
-    umbral_minimo_control = 0.1      
-    base_sigma_control = 22.0       
-    if variance_vr < umbral_minimo_control:
-        sigma_control = base_sigma_control * (umbral_minimo_control / (variance_vr + epsilon))
-    else:
-        sigma_control = base_sigma_control
-
-    logging.info(f"[DEBUG] Variance tdb: {variance_tdb}, sigma_ambiente ajustado: {sigma_ambiente}")
-    logging.info(f"[DEBUG] Variance vr: {variance_vr}, sigma_control ajustado: {sigma_control}")
-
-   
-    for p in final_particles:
-        if "tdb" in p.estado.ambiente:
-            p.estado.ambiente["tdb"] += np.random.normal(0, 2)
-        if "Tr" in p.estado.ambiente:
-            p.estado.ambiente["Tr"] += np.random.normal(0, 2)
-
- 
-    for p in final_particles:
-        if hasattr(p.estado, "ambiente"):
-            for key, value in p.estado.ambiente.items():
-                try:
-                    p.estado.ambiente[key] = value + np.random.normal(0, sigma_ambiente)
-                except Exception as ex:
-                    print(f"[WARNING] No se pudo perturbar {key} en ambiente: {ex}")
-        if hasattr(p.estado, "control"):
-            for key, value in p.estado.control.items():
-                try:
-                    p.estado.control[key] = value + np.random.normal(0, sigma_control)
-                except Exception as ex:
-                    print(f"[WARNING] No se pudo perturbar {key} en control: {ex}")
-
-    for p in final_particles:
-        p.estado = validate_estado(p.estado)
-
-    agente.set_belief(pomdp_py.Particles(final_particles))
-    print(f"[DEBUG] Creencia final re-sampleada a {desired_N} partículas con roughening.")
-
-  
-    if len(agente.cur_belief.particles) == 0:
-        print("[WARNING] No hay partículas válidas. Generando un estado aleatorio.")
+    if len(final_particles) == 0:
+        logging.warning("[WARNING] No hay partículas válidas. Generando un estado aleatorio.")
         agente.set_belief(pomdp_py.Particles([EstadoConfortTermico.generar_estado_aleatorio()]))
 
-    for idx, p in enumerate(agente.cur_belief.particles[:5]):
-        print(f"[DEBUG] Partícula {idx}: Tipo de estado: {type(p.estado)}, estado: {p.estado}")
+    for idx, p in enumerate(final_particles[:5]):
+        logging.info(f"[DEBUG] Partícula {idx}: Tipo de estado: {type(p.estado)}, estado: {p.estado}")
 
 
 def prueba_basica():
