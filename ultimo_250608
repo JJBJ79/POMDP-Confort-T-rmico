@@ -407,63 +407,116 @@ class ModeloDeObservacion(pomdp_py.ObservationModel):
 
 class ModeloBayesianoConfort:
     def __init__(self):
-        """Inicializa la estructura del modelo Bayesiano con todas las relaciones térmicas y ambientales."""
+        """
+        Inicializa el modelo Bayesiano para el confort térmico.
+        Para simplificar la inferencia, se asume que la variabilidad relevante se capta en:
+          - Tt (equivalente a tdb), la temperatura que muestra el equipo (o target),
+          - vr, velocidad del aire,
+          - rh, humedad relativa.
+        De esta forma, el CPD para PMV se define con estas tres variables (generando 8 combinaciones).
+        """
+        # Se define una estructura reducida para PMV
         self.model = BayesianModel([
-            ('Tt', 'tdb'), ('tdb', 'Pa'), ('rh', 'Pa'), ('tdb', 'Tr'),
-            ('Tcl', 'Hc'), ('rh', 'Tcl'), ('Pa', 'Tcl'), ('Tr', 'Tcl'),
-            ('Icl', 'Tcl'), ('vr', 'Hc'), ('tdb', 'Hc'),
-            ('Pa', 'PMV'), ('Tr', 'PMV'), ('Tcl', 'PMV'), ('Tt', 'PMV'),
-            ('vr', 'PMV'), ('M', 'PMV'), ('W', 'PMV'), ('Icl', 'PMV')
+            # Relaciones que reflejan cómo se mueve la temperatura
+            ('Tt', 'tdb'),        # Tt afecta directamente a tdb (son equivalentes)
+            ('Tt', 'tr'),         # Tt influye en la temperatura radiante
+            ('tdb', 'Pa'),        # La temperatura del aire influye en la presión (Pa) conjuntamente con rh
+            ('rh', 'Pa'),
+            ('Tt', 'Tcl'),        # Tt también influye en el equilibrio (Tcl)
+            # Para PMV sólo se incluyen las variables observables clave:
+            ('Tt', 'PMV'),
+            ('vr', 'PMV'),
+            ('rh', 'PMV')
         ])
+        
         self.infer = None
 
         try:
             self.construir_red()
         except Exception as e:
             logging.error(f"[ERROR] No se pudo construir la red Bayesiana: {e}")
-            self.infer = None  # 🔹 Evita que `inferir_pmv()` use un modelo no válido
+            self.infer = None  # Para evitar que inferir_pmv() opere sobre un modelo no válido
 
     def construir_red(self):
-        """Construye la red bayesiana con distribuciones condicionales probables."""
+        """Construye la red bayesiana con los CPDs para las variables involucradas."""
         try:
-            # 🔹 Definición de CPDs
-            cpd_PMV = TabularCPD(
-                variable='PMV', variable_card=2,
-                values=np.full((2, 16), 0.5).tolist(),  # 🔹 Corrección de la forma de la matriz
-                evidence=['Pa', 'Tr', 'Tcl', 'Tt', 'vr', 'M', 'W', 'Icl'],
-                evidence_card=[2, 2, 2, 2, 2, 2, 2, 2]
+            # ── CPDs de variables independientes ──
+            cpd_Tt = TabularCPD(variable='Tt', variable_card=2, values=[[0.3], [0.7]])
+            cpd_vr = TabularCPD(variable='vr', variable_card=2, values=[[0.5], [0.5]])
+            cpd_rh = TabularCPD(variable='rh', variable_card=2, values=[[0.6], [0.4]])
+            
+            # ── CPDs derivadas ──
+            # Dado que Tt se asume equivalente a tdb, se define una CPD identidad para tdb
+            cpd_tdb = TabularCPD(
+                variable='tdb', variable_card=2,
+                values=[[1.0, 0.0],
+                        [0.0, 1.0]],
+                evidence=['Tt'], evidence_card=[2]
+            )
+            # CPD para Tr, dependiente de Tt (por ejemplo)
+            cpd_tr = TabularCPD(
+                variable='tr', variable_card=2,
+                values=[[0.8, 0.4],
+                        [0.2, 0.6]],
+                evidence=['Tt'], evidence_card=[2]
+            )
+            # CPD para Pa, dependiente de tdb y rh
+            cpd_Pa = TabularCPD(
+                variable='Pa', variable_card=2,
+                values=[[0.7, 0.5, 0.6, 0.3],
+                        [0.3, 0.5, 0.4, 0.7]],
+                evidence=['tdb', 'rh'], evidence_card=[2, 2]
+            )
+            # CPD para Tcl, dependiente de Tt (se recalcula para el equilibrio térmico)
+            cpd_Tcl = TabularCPD(
+                variable='Tcl', variable_card=2,
+                values=[[0.7, 0.4],
+                        [0.3, 0.6]],
+                evidence=['Tt'], evidence_card=[2]
             )
 
-            # 🔹 Verificar la forma correcta antes de agregar CPD
-            if np.array(cpd_PMV.values).shape != (2, 16):
-                raise ValueError(f"[ERROR] Forma de `cpd_PMV` incorrecta: {np.array(cpd_PMV.values).shape}. Debe ser (2, 16).")
-
-            # 🔹 Agregar CPDs al modelo
-            self.model.add_cpds(cpd_PMV)
-
-            # 🔹 Validación de la estructura probabilística
+            # ── CPD para PMV ──
+            # Se define PMV considerando 3 evidencias: Tt, vr y rh, produciendo 2^3 = 8 combinaciones.
+            values_pmv = np.full((2, 8), 0.5).tolist()
+            logging.debug(f"[DEBUG] Forma generada para `cpd_PMV`: {np.array(values_pmv).shape}")
+            cpd_PMV = TabularCPD(
+                variable='PMV', variable_card=2,
+                values=values_pmv,
+                evidence=['Tt', 'vr', 'rh'],
+                evidence_card=[2, 2, 2]
+            )
+            if np.array(values_pmv).shape != (2, 8):
+                raise ValueError(f"[ERROR] Forma de `cpd_PMV` incorrecta: {np.array(values_pmv).shape}. Debe ser (2,8).")
+            
+            # ── Agregar todos los CPDs al modelo ──
+            self.model.add_cpds(
+                cpd_Tt, cpd_vr, cpd_rh,
+                cpd_tdb, cpd_tr, cpd_Pa, cpd_Tcl, cpd_PMV
+            )
+            
+            # ── Validar la estructura del modelo ──
             if not self.model.check_model():
                 raise Exception("[ERROR] El modelo Bayesiano no es válido.")
-
+            
             self.infer = VariableElimination(self.model)
             logging.info("[INFO] Modelo Bayesiano configurado correctamente.")
-
         except Exception as e:
             logging.error(f"[ERROR] No se pudo inicializar el modelo bayesiano: {e}")
             raise
 
     def inferir_pmv(self, evidencia):
-        """Realiza una inferencia sobre PMV basándose en la evidencia proporcionada."""
+        """
+        Realiza una inferencia sobre PMV basándose en la evidencia.
+        Se espera que la evidencia sea un diccionario con las claves 'Tt', 'vr' y 'rh'.
+        """
         try:
             if not isinstance(evidencia, dict):
                 raise TypeError("[ERROR] La evidencia debe ser un diccionario.")
-
             if self.infer is None:
-                raise ValueError("[ERROR] La inferencia no está inicializada correctamente. Verifica `construir_red()`.")
-
+                raise ValueError("[ERROR] La inferencia no está inicializada correctamente. Verifica construir_red().")
+            
             query_result = self.infer.query(variables=['PMV'], evidence=evidencia)
             return query_result['PMV']
-
         except Exception as e:
             logging.error(f"[ERROR] Fallo en la inferencia de PMV: {e}")
             return None
