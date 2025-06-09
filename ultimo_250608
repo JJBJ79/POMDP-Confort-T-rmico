@@ -1,0 +1,1426 @@
+# Confort Termico c/POMDP
+import pomdp_py
+from pomdp_py.utils import TreeDebugger
+import random
+import numpy as np
+import sys
+import copy
+import math
+from itertools import product
+import json
+import logging
+from tqdm import tqdm
+from math import floor
+import time
+from pgmpy.models.DiscreteBayesianNetwork import DiscreteBayesianNetwork as BayesianModel
+from pgmpy.factors.discrete import TabularCPD
+from pgmpy.inference import VariableElimination
+import traceback
+from pythermalcomfort.models import pmv_ppd_iso
+from pomdp_py.algorithms.po_uct import POUCT
+from pomdp_py.algorithms.po_uct import RandomRollout
+from scipy.stats import norm
+from copy import deepcopy
+from collections import Counter
+
+
+def setup_logging():
+
+    root_logger = logging.getLogger()
+    if root_logger.hasHandlers():
+        root_logger.handlers.clear()
+
+    logging.basicConfig(
+        filename="registro_consola.log",
+        filemode="w",
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        level=logging.DEBUG,
+        force=True
+    )
+
+    class RedirigirSalida:
+        def write(self, message):
+            if message.strip():
+                logging.info(message.strip())
+
+        def flush(self):
+            pass
+
+    sys.stdout = RedirigirSalida()
+    sys.stderr = RedirigirSalida()
+
+
+setup_logging()
+
+
+class EstadoConfortTermico(pomdp_py.State):
+    def __init__(self, ambiente, control, persona, transferencia, pmv=None):
+        super().__init__()
+
+        if not all(isinstance(param, dict) for param in [ambiente, control, persona, transferencia]):
+            raise ValueError("[ERROR] Los parámetros deben ser diccionarios válidos.")
+
+        self.ambiente = {
+            "tdb": float(ambiente["tdb"]),
+            "tr": float(ambiente["tr"]),
+            "rh": float(ambiente["rh"]),
+            "pa": float(ambiente["Pa"])
+        }
+        self.control = {
+            "Tt": float(control["Tt"]),
+            "vr": float(control["vr"])
+        }
+        self.persona = {
+            "met": float(persona["M"]),
+            "wme": float(persona["W"]),
+            "clo": float(persona["Icl"])
+        }
+        self.transferencia = {
+            "hc": float(transferencia["hc"]),
+            "Tcl": float(transferencia["Tcl"])
+        }
+
+        # 🔹 Garantizar que PMV tenga siempre un valor válido
+        self.pmv = pmv if pmv is not None else self.calcular_pmv()
+        if np.isnan(self.pmv) or np.isinf(self.pmv):
+            logging.warning("[WARNING] PMV inicial es NaN o inf, asignando valor seguro.")
+            self.pmv = 0.0  
+
+        logging.debug(f"[DEBUG] Estado inicial creado: {self}")
+
+    @classmethod
+    def generar_estado_aleatorio(cls):
+        tdb = round(np.clip(random.uniform(0, 40), 5, 35), 1)
+        tr = round(np.clip(tdb + random.gauss(0, 2), 5, 45), 1)
+        ambiente = {
+            "rh": round(random.uniform(0, 100), 1),
+            "tdb": tdb,
+            "tr": tr,
+            "Pa": round(random.uniform(500, 5600), 1)
+        }
+        control = {
+            "Tt": round(random.uniform(16, 33), 1),
+            "vr": round(np.clip(random.uniform(0, 2), 0, 2), 1)
+        }
+        persona = {
+            "M": round(np.clip(random.uniform(0.8, 1.8), 0.8, 4.0), 2),
+            "W": round(np.clip(random.uniform(0.1, 0.3), 0, 0.3), 2),
+            "Icl": round(np.clip(random.uniform(0.5, 1.2), 0.5, 1.2), 2)
+        }
+        transferencia = {
+            "hc": round(np.clip(random.uniform(3.5, 5), 2, 6), 2),
+            "Tcl": round(np.clip(random.uniform(22, 28), 5, 30), 2)
+        }
+
+        estado = cls(ambiente=ambiente, control=control, persona=persona, transferencia=transferencia)
+        
+        # 🔹 Validación de PMV en estado aleatorio
+        if np.isnan(estado.pmv) or np.isinf(estado.pmv):
+            logging.warning("[WARNING] Estado aleatorio generó PMV inválido, corrigiendo...")
+            estado.pmv = 0.0  
+
+        return estado
+
+    def calcular_pmv(self):
+        tdb = np.clip(self.ambiente["tdb"], 10.0, 35.0)
+        tr = np.clip(self.ambiente["tr"], 10.0, 35.0)
+        rh = np.clip(self.ambiente["rh"], 0.0, 100.0)
+        met = np.clip(self.persona["met"], 0.5, 2.0)
+        clo = np.clip(self.persona["clo"], 0.1, 1.5)
+        wme = self.persona["wme"]
+        vr = np.clip(self.control["vr"], 0.05, 2.0)
+
+        logging.debug(f"[DEBUG PMV_IN] tdb={tdb}, tr={tr}, rh={rh}%, met={met}, clo={clo}, wme={wme}, vr={vr}")
+
+        try:
+            resultado = pmv_ppd_iso(tdb=tdb, tr=tr, vr=vr, rh=rh, met=met, clo=clo, wme=wme)
+            pmv_val = resultado.pmv
+            
+            if np.isnan(pmv_val) or np.isinf(pmv_val):
+                logging.warning("[WARNING] PMV calculado es NaN o infinito, asignando valor seguro.")
+                return 0.0  
+
+            return pmv_val  
+
+        except Exception as e:
+            logging.error(f"[ERROR] pmv_ppd_iso falló: {e}")
+            return 0.0  
+
+    def __eq__(self, other):
+        """Define igualdad entre estados para que sean comparables en POMDP."""
+        if isinstance(other, EstadoConfortTermico):
+            return (self.ambiente == other.ambiente and
+                    self.control == other.control and
+                    self.persona == other.persona and
+                    self.transferencia == other.transferencia and
+                    round(self.pmv, 5) == round(other.pmv, 5))
+        return False
+
+    def __hash__(self):
+        """Permite el uso de `EstadoConfortTermico` dentro de distribuciones de partículas en POMDP."""
+        return hash((
+            tuple(sorted(self.ambiente.items())),
+            tuple(sorted(self.control.items())),
+            tuple(sorted(self.persona.items())),
+            tuple(sorted(self.transferencia.items())),
+            round(self.pmv, 5)  # 🔹 Asegurar que PMV sea un número válido para hashing
+        ))
+
+
+class Particula:
+    def __init__(self, estado, weight=1.0):
+        if isinstance(estado, Particula):
+            logging.debug(
+                "[DEBUG] Inicializando partícula desde otra Particula.")
+            self.estado = copy.deepcopy(estado.estado)
+            self.weight = estado.weight
+        else:
+            if not isinstance(estado, EstadoConfortTermico):
+                raise TypeError(
+                    "[ERROR] 'estado' debe ser una instancia de EstadoConfortTermico.")
+
+            if not isinstance(weight, (int, float)) or weight <= 0:
+                raise ValueError(
+                    "[ERROR] 'weight' debe ser un número positivo.")
+
+            self.estado = copy.deepcopy(estado)
+            self.weight = float(weight)
+
+        logging.debug(f"[DEBUG] Particula creada: estado={
+                      self.estado}, weight={self.weight:.4f}")
+
+    def copy(self):
+        """Devuelve una copia profunda de la partícula."""
+        logging.debug("[DEBUG] Creando copia de Particula.")
+        return Particula(copy.deepcopy(self.estado), self.weight)
+
+    def resample(self, modelo_bayesiano=None):
+        """
+        Opcionalmente, usa `ParticulaGenerativa` para regenerar el estado si el peso es muy bajo.
+        Si `modelo_bayesiano` está definido, ajusta la probabilidad de transición.
+        """
+        if self.weight < 0.05:  # 🔹 Evita partículas con peso despreciable
+            logging.info(
+                f"[INFO] Resampleo activado para partícula con peso bajo ({self.weight:.4f}).")
+            generador = ParticulaGenerativa(self.estado)
+            # 🔹 Asigna peso inicial al estado muestreado
+            return Particula(generador.sample(), weight=1.0)
+
+        if modelo_bayesiano:
+            evidencia = {
+                "tdb": self.estado.ambiente.get("tdb", 25),
+                "Tt": self.estado.control.get("Tt", 25),
+                "vr": self.estado.control.get("vr", 0.5),
+                "rh": self.estado.ambiente.get("rh", 50)
+            }
+            pmv_probabilidad = modelo_bayesiano.inferir_variable(
+                "PMV", evidencia)
+            # 🔹 Ajuste dinámico del peso
+            self.weight *= max(pmv_probabilidad[1], 0.05)
+
+        return self.copy()
+
+    def __repr__(self):
+        return f"Particula(estado={self.estado}, weight={self.weight:.4f})"
+
+
+class ParticulaGenerativa(pomdp_py.framework.basics.GenerativeDistribution):
+
+    def __init__(self, estado_base):
+        if not isinstance(estado_base, EstadoConfortTermico):
+            raise TypeError(
+                "[ERROR] 'estado_base' debe ser una instancia de EstadoConfortTermico.")
+        self.estado_base = estado_base
+
+    def sample(self):
+        """Genera un nuevo estado basado en ruido controlado."""
+        return EstadoConfortTermico(
+            ambiente={
+                "tdb": np.clip(self.estado_base.ambiente["tdb"] + np.random.normal(0, 1.5), 10, 35),
+                "tr": np.clip(self.estado_base.ambiente["tr"] + np.random.normal(0, 1.2), 18, 30),
+                "rh": np.clip(self.estado_base.ambiente["rh"] + np.random.normal(0, 2.0), 20, 80),
+                "pa": self.estado_base.ambiente["pa"]
+            },
+            control={
+                "Tt": np.clip(self.estado_base.control["Tt"] + np.random.normal(0, 1.0), 16, 33),
+                "vr": np.clip(self.estado_base.control["vr"] + np.random.normal(0, 0.3), 0.05, 2.0)
+            },
+            persona={
+                "met": np.clip(self.estado_base.persona["met"] + np.random.normal(0, 0.02), 0.8, 1.8),
+                "wme": np.clip(self.estado_base.persona["wme"] + np.random.normal(0, 0.01), 0.1, 0.3),
+                "clo": np.clip(self.estado_base.persona["clo"] + np.random.normal(0, 0.02), 0.5, 1.2)
+            },
+            transferencia={
+                "hc": np.clip(self.estado_base.transferencia["hc"] + np.random.normal(0, 0.5), 2, 6),
+                "Tcl": np.clip(self.estado_base.transferencia["Tcl"] + np.random.normal(0, 0.8), 22, 30)
+            },
+            pmv=None
+        )
+
+    def mpe(self):
+        """Devuelve el estado con la mayor probabilidad (sin ruido)."""
+        return self.estado_base
+
+    def get_histogram(self):
+        """Simula una distribución de probabilidad sobre estados generados."""
+        return {self.sample(): 1.0}  # 🔹 Se ajustará según el contexto de resampleo en `belief.particles`
+
+
+class ObservacionConfort(pomdp_py.Observation):
+
+    def __init__(self, tdb, Tt, vr, rh):
+        """Inicializa una observación validando rangos físicos y asegurando coherencia con EstadoConfortTermico."""
+        self.tdb = float(np.clip(tdb if tdb is not None else 25.0, 10.0, 35.0))
+        self.Tt = float(np.clip(Tt if Tt is not None else 22.0, 16.0, 33.0))
+        self.vr = float(np.clip(vr if vr is not None else 0.5, 0.05, 2.0))
+        self.rh = float(np.clip(rh if rh is not None else 50.0, 20.0, 80.0))
+
+        logging.debug(f"[DEBUG] Observación inicializada: tdb={
+                      self.tdb}, Tt={self.Tt}, vr={self.vr}, rh={self.rh}")
+
+    def simular_variacion(self):
+        tdb_variacion = np.random.uniform(-0.5, 0.5)
+        rh_variacion = np.random.uniform(-1, 1)
+        Tt_variacion = np.random.uniform(-0.5, 0.5)
+        vr_variacion = np.random.uniform(-0.05, 0.05)
+
+        obs_variada = ObservacionConfort(
+            tdb=np.clip(self.tdb + tdb_variacion, 10.0, 35.0),
+            Tt=np.clip(self.Tt + Tt_variacion, 16.0, 33.0),
+            vr=np.clip(self.vr + vr_variacion, 0.05, 2.0),
+            rh=np.clip(self.rh + rh_variacion, 20.0, 80.0)
+        )
+
+        logging.info(f"[DEBUG] Observación variada generada: {obs_variada}")
+        return obs_variada
+
+    def __repr__(self):
+        return f"ObservacionConfort(tdb={self.tdb:.2f}, Tt={self.Tt:.2f}, vr={self.vr:.2f}, rh={self.rh:.2f})"
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, ObservacionConfort)
+            and math.isclose(self.tdb, other.tdb, abs_tol=1e-5)
+            and math.isclose(self.Tt, other.Tt, abs_tol=1e-5)
+            and math.isclose(self.vr, other.vr, abs_tol=1e-5)
+            and math.isclose(self.rh, other.rh, abs_tol=1e-5)
+        )
+
+    def __hash__(self):
+        hash_val = hash(tuple(round(x, 6)
+                        for x in (self.tdb, self.Tt, self.vr, self.rh)))
+        logging.debug(f"[DEBUG] Hash de observación: {hash_val}")
+        return hash_val
+
+
+class ModeloDeObservacion(pomdp_py.ObservationModel):
+
+    def __init__(self, ruido_observacion=0.15):
+        if not isinstance(ruido_observacion, (float, int)) or ruido_observacion < 0:
+            raise ValueError(
+                "[ERROR] 'ruido_observacion' debe ser un número positivo.")
+
+        self.ruido_observacion = max(0.2, min(1.0, ruido_observacion * 1.5))
+        logging.info(f"[DEBUG] ModeloDeObservacion inicializado con ruido_observacion={
+                     self.ruido_observacion}")
+
+    def sample(self, estado, accion):
+        try:
+            if not isinstance(estado, EstadoConfortTermico):
+                raise TypeError(
+                    "[ERROR] 'estado' debe ser una instancia de EstadoConfortTermico.")
+
+            observacion = ObservacionConfort(
+                tdb=np.clip(estado.ambiente.get("tdb", 25) +
+                            np.random.normal(0, self.ruido_observacion), 10, 35),
+                Tt=np.clip(estado.control.get("Tt", 25) +
+                           np.random.normal(0, self.ruido_observacion), 16, 33),
+                vr=np.clip(estado.control.get("vr", 0.5) +
+                           np.random.normal(0, self.ruido_observacion), 0.05, 2.0),
+                rh=np.clip(estado.ambiente.get("rh", 50) +
+                           np.random.normal(0, self.ruido_observacion), 20, 80)
+            )
+
+            logging.debug(
+                f"[DEBUG] Observación generada correctamente: {observacion}")
+            return observacion
+
+        except Exception as e:
+            logging.error(
+                f"[ERROR] Falló la generación de la observación: {e}")
+            raise e
+
+    def probability(self, obs, estado, accion):
+        try:
+            if not isinstance(obs, ObservacionConfort):
+                raise TypeError(
+                    "[ERROR] 'obs' debe ser una instancia de ObservacionConfort.")
+            if not isinstance(estado, EstadoConfortTermico):
+                raise TypeError(
+                    "[ERROR] 'estado' debe ser una instancia de EstadoConfortTermico.")
+
+            sigma = max(1.0, min(15, self.ruido_observacion * 3))
+
+            state_values = {
+                "tdb": estado.ambiente.get("tdb", 25),
+                "Tt": estado.control.get("Tt", 25),
+                "vr": estado.control.get("vr", 0.5),
+                "rh": estado.ambiente.get("rh", 50)
+            }
+
+            probabilidad = np.mean([
+                (1 / (sigma * np.sqrt(2 * np.pi))) *
+                np.exp(-0.5 * ((getattr(obs, attr) -
+                       state_values[attr]) / sigma) ** 2)
+                for attr in ["tdb", "Tt", "vr", "rh"]
+            ])
+
+            logging.debug(
+                f"[DEBUG] Probabilidad calculada correctamente: {probabilidad}")
+            return probabilidad
+
+        except Exception as e:
+            logging.error(f"[ERROR] Falló el cálculo de probabilidad: {e}")
+            raise e
+
+    def get_all_observations(self):
+        """Genera un conjunto de observaciones posibles con variabilidad controlada."""
+        try:
+            observaciones = [
+                ObservacionConfort(
+                    tdb=np.clip(np.random.normal(25, 5), 10, 35),
+                    Tt=np.clip(np.random.normal(24, 4), 16, 33),
+                    vr=np.clip(np.random.normal(0.5, 0.2), 0.05, 2.0),
+                    rh=np.clip(np.random.normal(50, 15), 20, 80)
+                )
+                for _ in range(100)
+            ]
+
+            logging.debug(f"[DEBUG] Se generaron {
+                          len(observaciones)} observaciones posibles.")
+            return observaciones
+
+        except Exception as e:
+            logging.error(f"[ERROR] Falló la generación de observaciones: {e}")
+            raise e
+
+
+class ModeloBayesianoConfort:
+    def __init__(self):
+        """Inicializa la estructura del modelo Bayesiano con todas las relaciones térmicas y ambientales."""
+        self.model = BayesianModel([
+            ('Tt', 'tdb'), ('tdb', 'Pa'), ('rh', 'Pa'), ('tdb', 'Tr'),
+            ('Tcl', 'Hc'), ('rh', 'Tcl'), ('Pa', 'Tcl'), ('Tr', 'Tcl'),
+            ('Icl', 'Tcl'), ('vr', 'Hc'), ('tdb', 'Hc'),
+            ('Pa', 'PMV'), ('Tr', 'PMV'), ('Tcl', 'PMV'), ('Tt', 'PMV'),
+            ('vr', 'PMV'), ('M', 'PMV'), ('W', 'PMV'), ('Icl', 'PMV')
+        ])
+        self.infer = None
+
+        try:
+            self.construir_red()
+        except Exception as e:
+            logging.error(f"[ERROR] No se pudo construir la red Bayesiana: {e}")
+            self.infer = None  # 🔹 Evita que `inferir_pmv()` use un modelo no válido
+
+    def construir_red(self):
+        """Construye la red bayesiana con distribuciones condicionales probables."""
+        try:
+            # 🔹 Definición de CPDs
+            cpd_PMV = TabularCPD(
+                variable='PMV', variable_card=2,
+                values=np.full((2, 16), 0.5).tolist(),  # 🔹 Corrección de la forma de la matriz
+                evidence=['Pa', 'Tr', 'Tcl', 'Tt', 'vr', 'M', 'W', 'Icl'],
+                evidence_card=[2, 2, 2, 2, 2, 2, 2, 2]
+            )
+
+            # 🔹 Verificar la forma correcta antes de agregar CPD
+            if np.array(cpd_PMV.values).shape != (2, 16):
+                raise ValueError(f"[ERROR] Forma de `cpd_PMV` incorrecta: {np.array(cpd_PMV.values).shape}. Debe ser (2, 16).")
+
+            # 🔹 Agregar CPDs al modelo
+            self.model.add_cpds(cpd_PMV)
+
+            # 🔹 Validación de la estructura probabilística
+            if not self.model.check_model():
+                raise Exception("[ERROR] El modelo Bayesiano no es válido.")
+
+            self.infer = VariableElimination(self.model)
+            logging.info("[INFO] Modelo Bayesiano configurado correctamente.")
+
+        except Exception as e:
+            logging.error(f"[ERROR] No se pudo inicializar el modelo bayesiano: {e}")
+            raise
+
+    def inferir_pmv(self, evidencia):
+        """Realiza una inferencia sobre PMV basándose en la evidencia proporcionada."""
+        try:
+            if not isinstance(evidencia, dict):
+                raise TypeError("[ERROR] La evidencia debe ser un diccionario.")
+
+            if self.infer is None:
+                raise ValueError("[ERROR] La inferencia no está inicializada correctamente. Verifica `construir_red()`.")
+
+            query_result = self.infer.query(variables=['PMV'], evidence=evidencia)
+            return query_result['PMV']
+
+        except Exception as e:
+            logging.error(f"[ERROR] Fallo en la inferencia de PMV: {e}")
+            return None
+
+
+class ModeloDeTransicion(pomdp_py.TransitionModel):
+    """Modelo de transición que incorpora inferencia bayesiana para evaluar probabilidades de cambio."""
+
+    def __init__(self, estados=None):
+        """Inicializa el modelo con una red bayesiana y una lista opcional de estados."""
+        super().__init__()
+        logging.info(
+            "[DEBUG] Se ha creado una instancia de ModeloDeTransicion")
+        self.estados = estados if estados else []
+
+        try:
+            self.modelo_bayesiano = ModeloBayesianoConfort()
+            self.modelo_bayesiano.construir_red()
+            logging.info(
+                "[DEBUG] Modelo bayesiano inicializado correctamente.")
+        except Exception as e:
+            logging.error(
+                f"[ERROR] No se pudo inicializar el modelo bayesiano: {e}")
+            self.modelo_bayesiano = None
+
+    def probability(self, estado_siguiente, estado_actual, accion):
+        """Calcula la probabilidad de transición considerando inferencia bayesiana con soft evidence."""
+        try:
+            logging.info("[DEBUG] Entré en probability")
+
+            def compute_soft_evidence(value, threshold, sigma):
+                """Calcula evidencia suavizada basada en distribución Gaussiana."""
+                p0 = np.exp(-0.5 * ((value - threshold) / sigma) ** 2)
+                p1 = 1 - p0
+                norm = max(p0 + p1, 1.0)  # Evitar divisiones por 0
+                return [p0 / norm, p1 / norm]
+
+            # 🔹 Parámetros ajustados para inferencia bayesiana
+            thresholds = {"tdb": 25, "Tt": 25, "vr": 0.5, "rh": 50}
+            sigma_vals = {"tdb": 2.0, "Tt": 2.0, "vr": 0.1, "rh": 10.0}
+            keys = ["tdb", "Tt", "vr", "rh"]
+
+            # 🔹 Calcular soft evidence para variables clave
+            soft_evidence = {
+                key: compute_soft_evidence(
+                    estado_actual.ambiente.get(
+                        key, thresholds[key]), thresholds[key], sigma_vals[key]
+                ) for key in keys
+            }
+            logging.debug(f"[DEBUG] Soft evidence calculada: {soft_evidence}")
+
+            total_prob = 0.0
+
+            # 🔹 Iteración sobre combinaciones de evidencia discreta
+            for combination in product([0, 1], repeat=len(keys)):
+                weight = np.prod([soft_evidence[key][combination[i]]
+                                 for i, key in enumerate(keys)])
+
+                evidence = {keys[i]: combination[i] for i in range(len(keys))}
+                logging.debug(f"[DEBUG] Evidencia: {
+                              evidence}, Peso parcial: {weight:.8f}")
+
+                # 🔹 Inferir distribución PMV desde la red bayesiana
+                pmv_distribution = self.modelo_bayesiano.inferir_pmv(
+                    evidence) if self.modelo_bayesiano else None
+
+                # 🔹 Evaluar estado siguiente
+                estado_siguiente.pmv = estado_siguiente.calcular_pmv()
+                observed_state = 0 if estado_siguiente.pmv < 0 else 1
+
+                try:
+                    contrib = weight * \
+                        pmv_distribution.get_value(PMV=observed_state)
+                except Exception as ex:
+                    logging.error(f"[ERROR] Fallo en get_value(): {ex}")
+                    try:
+                        contrib = weight * \
+                            pmv_distribution.values[observed_state]
+                    except Exception as ex2:
+                        logging.error(
+                            f"[ERROR] Fallo en acceso a pmv_distribution.values: {ex2}")
+                        contrib = 0.0
+
+                logging.debug(f"[DEBUG] Contribución calculada: {contrib:.8f}")
+                total_prob += contrib
+
+            logging.info(f"[DEBUG] Probabilidad total calculada: {
+                         total_prob:.8f}")
+            return total_prob
+
+        except Exception as e:
+            logging.error(
+                f"[ERROR] Falló la inferencia bayesiana en transición con soft evidence: {e}")
+            return 0.0
+
+
+class ModeloDeRecompensa(pomdp_py.RewardModel):
+    """Modelo de recompensa basado en la calidad del confort térmico."""
+
+    def __init__(self, pmv_deseado=0.0, factor_pmv=1.0):
+        """Inicializa el modelo con un PMV deseado y un factor ajustable para la recompensa."""
+        super().__init__()
+
+        if not isinstance(pmv_deseado, (int, float)):
+            raise ValueError("[ERROR] 'pmv_deseado' debe ser un número (int o float).")
+        if not isinstance(factor_pmv, (int, float)) or factor_pmv <= 0:
+            raise ValueError("[ERROR] 'factor_pmv' debe ser un número positivo.")
+
+        self.pmv_deseado = pmv_deseado
+        self.factor_pmv = factor_pmv
+
+    def reward(self, estado, accion):
+        """Calcula la recompensa basada en la desviación del PMV respecto al PMV deseado."""
+        try:
+            pmv_actual = estado.pmv if estado.pmv is not None else estado.calcular_pmv()
+            logging.debug(f"[DEBUG] Evaluando recompensa: PMV={pmv_actual}, Acción={accion}")
+
+            desviacion_pmv = abs(pmv_actual - self.pmv_deseado)
+
+            if desviacion_pmv < 0.5:  # 🔹 Rango óptimo de confort térmico
+                return 10.0 * self.factor_pmv
+            elif desviacion_pmv < 1.5:  # 🔹 Moderado pero aceptable
+                return 5.0 * self.factor_pmv
+            else:  # 🔹 Penalización por alejarse demasiado del PMV deseado
+                return -10.0 * self.factor_pmv
+
+        except Exception as e:
+            logging.error(f"[ERROR] Fallo en cálculo de recompensa: {e}")
+            return -20.0  # 🔹 Penalización por error
+
+
+class ModeloDePolitica(pomdp_py.RolloutPolicy):
+    """Define la estrategia de decisión del agente POMDP basada en el PMV deseado."""
+
+    def __init__(self, pmv_deseado, acciones=None):
+        """Inicializa la política de rollout con un PMV deseado y un conjunto de acciones posibles."""
+        super().__init__()
+
+        if not isinstance(pmv_deseado, (int, float)):
+            raise ValueError("[ERROR] 'pmv_deseado' debe ser un número (int o float).")
+
+        self.pmv_deseado = pmv_deseado
+        self.acciones = acciones if isinstance(acciones, list) and acciones else [
+            "Reducir temperatura",
+            "Mantener configuración",
+            "Aumentar ventilación"
+        ]
+
+    def get_all_actions(self, state=None):
+        return self.acciones
+
+    def rollout(self, estado):
+        """Define la política de simulación en la búsqueda POMDP."""
+        try:
+            logging.debug(f"[DEBUG] Rollout ejecutado para estado {estado}")
+
+            if estado.pmv is not None and estado.pmv > self.pmv_deseado + 1.5:
+                accion = "Reducir temperatura"
+            elif estado.pmv is not None and estado.pmv < self.pmv_deseado - 0.5:
+                accion = "Aumentar ventilación"
+            else:
+                accion = "Mantener configuración"
+
+            return accion
+
+        except Exception as e:
+            logging.error(f"[ERROR] Fallo en la política de rollout: {e}")
+            return "Acción desconocida"
+
+
+class AccionConfortTermico(pomdp_py.Action):
+    """Representa una acción de ajuste en el sistema de confort térmico."""
+
+    def __init__(self, cambio_de_temperatura: float = 0.0, cambio_de_flujo_de_aire: float = 0.0):
+        if not isinstance(cambio_de_temperatura, (int, float)):
+            raise TypeError("[ERROR] 'cambio_de_temperatura' debe ser un número.")
+        if not isinstance(cambio_de_flujo_de_aire, (int, float)):
+            raise TypeError("[ERROR] 'cambio_de_flujo_de_aire' debe ser un número.")
+        if not (-1.0 <= cambio_de_temperatura <= 1.0):
+            raise ValueError(f"[ERROR] Valor fuera de rango: cambio_de_temperatura={cambio_de_temperatura}")
+        if not (-1.0 <= cambio_de_flujo_de_aire <= 1.0):
+            raise ValueError(f"[ERROR] Valor fuera de rango: cambio_de_flujo_de_aire={cambio_de_flujo_de_aire}")
+
+        self.cambio_de_temperatura = round(cambio_de_temperatura, 2)
+        self.cambio_de_flujo_de_aire = round(cambio_de_flujo_de_aire, 2)
+
+    def __repr__(self):
+        return (f"AccionConfortTermico(Temp={self.cambio_de_temperatura}, Flujo={self.cambio_de_flujo_de_aire})")
+
+    def __eq__(self, other):
+        return (isinstance(other, AccionConfortTermico) and 
+                self.cambio_de_temperatura == other.cambio_de_temperatura and 
+                self.cambio_de_flujo_de_aire == other.cambio_de_flujo_de_aire)
+
+    def __hash__(self):
+        """Permite el uso de `AccionConfortTermico` dentro de estructuras hashables en POMDP."""
+        return hash((self.cambio_de_temperatura, self.cambio_de_flujo_de_aire))
+
+    def ejecutar_accion(self, estado):
+        """Aplica la acción sobre el estado, ajustando temperatura y flujo de aire."""
+        estado.ambiente["tdb"] += self.cambio_de_temperatura
+        estado.control["vr"] += self.cambio_de_flujo_de_aire
+
+        # Clipping para mantener valores dentro de rangos físicos válidos
+        estado.ambiente["tdb"] = max(2.0, min(35.0, estado.ambiente["tdb"]))
+        estado.control["vr"] = max(0.0, min(2.0, estado.control["vr"]))
+
+        estado.pmv = estado.calcular_pmv()
+        logging.debug(f"[DEBUG] Acción aplicada: tdb={estado.ambiente['tdb']}, vr={estado.control['vr']}")
+
+    def es_accion_valida(self) -> bool:
+        """Verifica si la acción está dentro de los rangos permitidos."""
+        return -1.0 <= self.cambio_de_temperatura <= 1.0 and -1.0 <= self.cambio_de_flujo_de_aire <= 1.0
+
+
+class ModeloDeEnvironment(pomdp_py.Environment):
+    """Modelo del entorno que gestiona la interacción con el agente POMDP."""
+
+    def __init__(self, modelo_transicion, modelo_observacion, modelo_recompensa, estado_inicial):
+        """Inicializa el entorno con los modelos correspondientes."""
+        super().__init__(modelo_transicion, modelo_observacion,
+                         modelo_recompensa, estado_inicial)
+
+        if not isinstance(estado_inicial, EstadoConfortTermico):
+            raise TypeError(
+                "[ERROR] 'estado_inicial' debe ser una instancia de EstadoConfortTermico.")
+
+        logging.info("[INFO] Entorno inicializado correctamente.")
+
+    def step(self, accion):
+        """Ejecuta una acción en el entorno y devuelve la nueva observación, recompensa y estado."""
+        try:
+            logging.debug(f"[DEBUG] Ejecutando acción: {accion}")
+
+            estado_siguiente = self.transition_model.sample(self.state, accion)
+            observacion = self.observation_model.sample(
+                estado_siguiente, accion)
+            recompensa = self.reward_model.reward(estado_siguiente, accion)
+
+            self.state = estado_siguiente  # 🔹 Actualiza el estado del entorno
+
+            return observacion, recompensa, estado_siguiente
+
+        except Exception as e:
+            logging.error(f"[ERROR] Fallo en step(): {e}")
+            return None, -20.0, self.state  # 🔹 Penalización en caso de error
+
+
+class AgentePersonalizado(pomdp_py.Agent):
+    """Agente POMDP que integra inferencia bayesiana y planificación eficiente para confort térmico."""
+
+    def __init__(self, belief, policy, transition_model, observation_model, reward_model, pmv, nombre=None):
+        """Inicializa el agente con validaciones y configura el planificador."""
+        self.nombre = nombre or "AgenteDesconocido"
+
+        try:
+            # 🔹 Validación de los modelos
+            if not isinstance(belief, pomdp_py.Particles):
+                raise TypeError(
+                    "[ERROR] 'belief' debe ser una instancia de pomdp_py.Particles.")
+
+            if not isinstance(policy, ModeloDePolitica):
+                raise TypeError(
+                    "[ERROR] 'policy' debe ser una instancia de ModeloDePolitica.")
+
+            if not all([transition_model, observation_model, reward_model]):
+                raise ValueError(
+                    "[ERROR] Uno o más modelos (transición, observación, recompensa) son None.")
+
+            self.policy = policy
+            super().__init__(belief, policy, transition_model, observation_model, reward_model)
+
+            self.pmv = pmv
+
+            # 🔹 Configuración del planificador POUCT
+            self.rollout_policy = pomdp_py.RandomRollout()
+            self.planificador = pomdp_py.POUCT(
+                max_depth=10,
+                num_sims=500,
+                discount_factor=0.95,
+                rollout_policy=self.rollout_policy
+            )
+
+            logging.info(
+                f"[INFO] AgentePersonalizado inicializado con éxito: {self.nombre}")
+
+        except Exception as e:
+            logging.exception(
+                "[ERROR] Falló la inicialización de AgentePersonalizado:")
+            raise e
+
+    def plan(self):
+        """Selecciona la mejor acción a ejecutar, integrando planificación con inferencia bayesiana."""
+        try:
+            accion = super().plan()
+
+            if accion is None:  # 🔹 Validación adicional en caso de error
+                logging.warning(
+                    "[WARN] Acción obtenida es None, intentando recuperación.")
+                accion = self.recuperar_accion_defecto()
+
+        except Exception as e:
+            logging.error(
+                "[ERROR] Error en plan(), activando recuperación de acción:", exc_info=True)
+            accion = self.recuperar_accion_defecto()
+
+        return accion
+
+    def recuperar_accion_defecto(self):
+        """Intenta recuperar una acción válida si el planificador falla."""
+        try:
+            acciones_disponibles = self.policy.get_all_actions()
+            if acciones_disponibles:
+                logging.info(
+                    "[INFO] Se usa la primera acción disponible como acción por defecto.")
+                return acciones_disponibles[0]
+            else:
+                logging.error(
+                    "[ERROR] La política no tiene acciones disponibles. No se puede definir acción por defecto.")
+                return None
+        except Exception as e:
+            logging.error(
+                "[ERROR] Fallo al obtener acciones de la política:", exc_info=True)
+            return None
+
+    def actualizar_belief(self, observacion):
+        """Actualiza la creencia del agente basándose en la observación recibida."""
+        try:
+            nueva_creencia = self.policy.update_belief(
+                self.belief, observacion)
+            self.belief = nueva_creencia
+            logging.info(
+                "[INFO] Creencia del agente actualizada correctamente.")
+        except Exception as e:
+            logging.error(
+                "[ERROR] Fallo en la actualización de creencias:", exc_info=True)
+
+
+class EntornoConfort(pomdp_py.Environment):
+    """Representa el entorno en el modelo POMDP de confort térmico."""
+
+    def __init__(self, estados, estado_inicial):
+        """Inicializa el entorno con validación de estados y configuración inicial."""
+        if not isinstance(estados, (list, set)) or not all(isinstance(e, EstadoConfortTermico) for e in estados):
+            raise ValueError(
+                "[ERROR] 'estados' debe ser una lista o conjunto de instancias de EstadoConfortTermico.")
+        if not isinstance(estado_inicial, EstadoConfortTermico):
+            raise ValueError(
+                "[ERROR] 'estado_inicial' debe ser una instancia válida de EstadoConfortTermico.")
+
+        self.estados = copy.deepcopy(estados)
+        self.estado_inicial = estado_inicial
+
+        super().__init__(estado_inicial)
+        logging.debug(f"[DEBUG] EntornoConfort inicializado con {
+                      len(self.estados)} estados posibles.")
+
+    def estados_posibles(self):
+        """Devuelve la lista de estados posibles en el entorno."""
+        return self.estados
+
+    def step(self, accion):
+        """Ejecuta una acción en el entorno y devuelve la nueva observación, recompensa y estado."""
+        try:
+            estado_siguiente = self.transition_model.sample(self.state, accion)
+            observacion = self.observation_model.sample(
+                estado_siguiente, accion)
+            recompensa = self.reward_model.reward(estado_siguiente, accion)
+
+            self.state = estado_siguiente  # 🔹 Actualiza el estado del entorno
+
+            return observacion, recompensa, estado_siguiente
+
+        except Exception as e:
+            logging.error(f"[ERROR] Fallo en step(): {e}")
+            return None, -20.0, self.state  # 🔹 Penalización en caso de error
+
+    def __repr__(self):
+        """Genera una representación del entorno con un ejemplo de estados."""
+        estados_ejemplo = self.estados[:3] if len(
+            self.estados) > 3 else self.estados
+        return f"EntornoConfort(estado_inicial={self.estado_inicial}, estados={len(self.estados)}, ejemplo={estados_ejemplo})"
+
+
+def crear_creencia_inicial_en_particulas(num_particulas=1000):
+    """Genera una distribución inicial de partículas basada en estados aleatorios de confort térmico,
+    asegurando que todas las partículas tengan un PMV válido."""
+
+    try:
+        logging.info(f"[INFO] Creando creencia inicial con {num_particulas} partículas...")
+
+        # 🔹 Generar estados aleatorios
+        particulas = [Particula(EstadoConfortTermico.generar_estado_aleatorio(), weight=1.0)
+                      for _ in range(num_particulas)]
+
+        # 🔹 Filtrar partículas con PMV inválido (NaN o infinito)
+        particulas_validas = [p for p in particulas if not np.isnan(p.estado.pmv) and not np.isinf(p.estado.pmv)]
+        cantidad_faltante = num_particulas - len(particulas_validas)
+
+        # 🔹 Generar nuevas partículas en caso de filtrado
+        if cantidad_faltante > 0:
+            logging.warning(f"[WARNING] {cantidad_faltante} partículas inválidas eliminadas, generando reemplazos...")
+            nuevas_particulas = [Particula(EstadoConfortTermico.generar_estado_aleatorio(), weight=1.0)
+                                 for _ in range(cantidad_faltante)]
+            particulas_validas.extend(nuevas_particulas)
+
+        # 🔹 Normalizar pesos de partículas
+        total_peso = sum(p.weight for p in particulas_validas) or 1.0
+        for p in particulas_validas:
+            p.weight /= total_peso  # 🔹 Normalización para mantener estabilidad en POMDP
+
+        belief = pomdp_py.Particles(particulas_validas)
+        logging.info("[INFO] Creencia inicial generada correctamente con partículas validadas.")
+
+        return belief
+
+    except Exception as e:
+        logging.error("[ERROR] Fallo en la generación de la creencia inicial:", exc_info=True)
+        return None
+
+
+def validate_estado(estado):
+    """Asegura que los valores de estado estén dentro de rangos físicos realistas."""
+    estado.ambiente["tdb"] = np.clip(estado.ambiente.get("tdb", 25), 15, 30)
+    estado.ambiente["tr"] = np.clip(estado.ambiente.get("tr", 25), 15, 35)
+    estado.ambiente["rh"] = np.clip(estado.ambiente.get("rh", 50), 20, 90)
+    estado.ambiente["Pa"] = np.clip(estado.ambiente.get("Pa", 1000), 800, 1200)
+    estado.control["Tt"] = np.clip(estado.control.get("Tt", 25), 16, 33)
+    estado.control["vr"] = np.clip(estado.control.get("vr", 0.5), 0, 2)
+    return estado
+
+
+def observacion_a_vector(observacion):
+    """Convierte una observación en un vector numérico."""
+    orden = ["tdb", "tr", "rh", "Pa", "Tt"]
+    if isinstance(observacion, dict):
+        return np.array([observacion.get(clave, 0) for clave in orden])
+    elif hasattr(observacion, '__dict__'):
+        return np.array([getattr(observacion, clave, 0) for clave in orden])
+    else:
+        raise TypeError("[ERROR] Tipo de observación no soportado.")
+
+
+def convert_belief_to_state_list(belief):
+    """Convierte la creencia en una lista de estados, asegurando compatibilidad con `Particula`."""
+    return [getattr(p, 'estado', p) for p in belief.particles]
+
+
+def update_belief_with_resample(agente, accion, observacion_real):
+    """Actualiza la creencia del agente aplicando resampling, evitando partículas inválidas y mejorando estabilidad."""
+
+    if not hasattr(agente, "policy") or not hasattr(agente, "cur_belief"):
+        logging.error(
+            "[ERROR] El agente no tiene una política o creencia válida.")
+        return
+
+    particulas_seguras = copy.deepcopy(agente.cur_belief.particles)
+    particulas_validas = [p for p in particulas_seguras if isinstance(
+        p, Particula) and not np.isnan(p.estado.pmv)]
+
+    # 🔹 Manejo de partículas inválidas
+    cantidad_faltante = len(particulas_seguras) - len(particulas_validas)
+    if cantidad_faltante > 0:
+        logging.warning(f"[WARNING] {
+                        cantidad_faltante} partículas con valores inválidos eliminadas y reemplazadas.")
+        nuevas_particulas = [Particula(
+            EstadoConfortTermico.generar_estado_aleatorio()) for _ in range(cantidad_faltante)]
+
+    particulas_finales = particulas_validas + nuevas_particulas
+    particulas_finales = roughen_particles(particulas_finales)
+
+    # 🔹 Asegurar que todas las partículas tengan `Tt` definido
+    for p in particulas_finales:
+        p.estado.control["Tt"] = p.estado.control.get(
+            "Tt", round(np.random.uniform(16, 33), 0))
+
+    # 🔹 Actualizar creencia del agente
+    agente.set_belief(pomdp_py.Particles(copy.deepcopy(particulas_finales)))
+
+    modelo_obs = ModeloDeObservacion()
+    for p in particulas_finales:
+        p.weight = modelo_obs.probability(observacion_real, p.estado, accion)
+
+    # 🔹 Evaluación de `n_eff`
+    n_eff = calculate_n_eff(particulas_finales)
+    if n_eff < max(500, len(particulas_finales) * 0.5):
+        particulas_finales = update_particles(
+            particulas_finales, n_eff_threshold=0.5 * len(particulas_finales))
+
+    particulas_finales = perturb_weights(particulas_finales)
+
+    # 🔹 Garantizar número adecuado de partículas
+    desired_N = 1000
+    if len(particulas_finales) < desired_N:
+        particulas_finales.extend([Particula(EstadoConfortTermico.generar_estado_aleatorio(
+        )) for _ in range(desired_N - len(particulas_finales))])
+
+    final_particles = RS_resample(
+        desired_N, [p.weight for p in particulas_finales], particulas_finales)
+    for p in final_particles:
+        p.weight = 1.0 / desired_N
+
+    # 🔹 Asignar la nueva creencia al agente
+    agente.set_belief(pomdp_py.Particles(final_particles))
+    logging.info(
+        f"[DEBUG] Creencia final re-sampleada a {desired_N} partículas.")
+
+
+def calculate_n_eff(particles):
+    """Calcula el número efectivo de partículas basado en sus pesos."""
+    weights = np.array([p.weight for p in particles])
+    return 1.0 / np.sum(np.square(weights)) if np.sum(np.square(weights)) > 0 else 0
+
+
+def systematic_resample(particles):
+    """Realiza un remuestreo sistemático basado en pesos."""
+    N = len(particles)
+    positions = (np.arange(N) + random.random()) / N
+    cumulative_sum = np.cumsum([p.weight for p in particles])
+    cumulative_sum[-1] = 1.0
+    indexes = np.searchsorted(cumulative_sum, positions)
+    new_particles = [particles[int(i)].copy() for i in indexes]
+    for p in new_particles:
+        p.weight = 1.0 / N
+    return new_particles
+
+
+def RS_resample(N, weights, particles):
+    """Remuestreo con el método de muestreo residual sistemático."""
+    cumulative_sum = np.cumsum(weights)
+    positions = np.random.uniform(0, 1.0 / N) + np.arange(N) / N
+    indexes = np.searchsorted(cumulative_sum, positions)
+    indexes = [min(idx, len(particles) - 1) for idx in indexes]
+    new_particles = [particles[int(i)].copy() for i in indexes]
+    for p in new_particles:
+        p.weight = 1.0 / N
+    return new_particles
+
+
+def roughen_particles(particles, sigma_factor=0.8, jitter_min=0.1):
+    """Introduce ruido en las partículas para mejorar la diversidad."""
+    for p in particles:
+        p.estado.ambiente["tdb"] += np.random.normal(
+            0, max(sigma_factor, jitter_min))
+        p.estado.ambiente["tr"] += np.random.normal(
+            0, max(sigma_factor, jitter_min))
+        p.estado.control["vr"] += np.random.normal(
+            0, max(sigma_factor, jitter_min))
+        p.estado.control["Tt"] += np.random.normal(
+            0, max(sigma_factor, jitter_min))
+    return particles
+
+
+def perturb_weights(particles, min_factor=0.95, max_factor=1.05):
+    """Perturba los pesos de las partículas y los normaliza."""
+    for p in particles:
+        p.weight *= np.random.uniform(min_factor, max_factor)
+    total_weight = sum(p.weight for p in particles) + 1e-6
+    for p in particles:
+        p.weight /= total_weight
+    return particles
+
+
+def update_particles(particles, n_eff_threshold):
+    """Realiza remuestreo si el número efectivo de partículas es bajo."""
+    n_eff = calculate_n_eff(particles)
+    logging.debug(f"[DEBUG] n_eff calculado: {n_eff}")
+    if n_eff < n_eff_threshold:
+        logging.info(f"[DEBUG] n_eff {n_eff} menor al umbral {
+                     n_eff_threshold}. Re-muestreando...")
+        particles = systematic_resample(particles)
+    return particles
+
+
+def prueba_basica():
+    """Ejecuta una prueba básica del sistema POMDP, asegurando que `Tt` influya en `tdb` y `rh`."""
+
+    logging.info("[INFO] Ejecutando prueba básica del sistema POMDP.")
+
+    try:
+        # 🔹 Inicialización de parámetros del estado
+        ambiente = {"rh": 38.0, "Pa": 93.9, "tdb": 24, "tr": 25.3}
+        control = {"Tt": 20, "vr": 0.75}
+        persona = {"M": 1.05, "W": 0.18, "Icl": 1.86}
+        transferencia = {"hc": 0.92, "Tcl": 22.4}
+        pmv = 1.0
+
+        logging.debug("[DEBUG] Inicializando EstadoConfortTermico...")
+        try:
+            estado_inicial = EstadoConfortTermico(
+                ambiente, control, persona, transferencia, pmv)
+            logging.debug(f"[DEBUG] Estado inicial creado correctamente: {
+                          estado_inicial}")
+        except Exception as e:
+            logging.error(
+                f"[ERROR] Fallo en la inicialización de EstadoConfortTermico: {e}")
+            return
+
+        # 🔹 Configuración del modelo de transición
+        modelo_transicion = ModeloDeTransicion()
+        logging.debug(f"[DEBUG] Modelo de Transición creado: {
+                      modelo_transicion}")
+
+        # 🔹 Creación de la creencia inicial
+        try:
+            logging.info(
+                "[TEST] Probando `crear_creencia_inicial_en_particulas()`...")
+            creencia = crear_creencia_inicial_en_particulas(
+                num_particulas=1000)
+            logging.info(
+                f"[TEST] Creencia inicial creada con éxito: {creencia}")
+
+            pesos = [p.weight for p in creencia.particles]
+            logging.debug(f"[DEBUG] Rango de pesos en creencia inicial: min={
+                          min(pesos)}, max={max(pesos)}, promedio={sum(pesos) / len(pesos)}")
+
+            if min(pesos) < 0.5:
+                logging.warning(
+                    "[WARNING] Algunos pesos son demasiado bajos. Ajustando...")
+                for p in creencia.particles:
+                    p.weight = max(0.5, p.weight)
+
+        except Exception as e:
+            logging.error(f"[TEST ERROR] La prueba de creencia inicial falló: {
+                          type(e).__name__}: {e}")
+            return
+
+        # 🔹 Validación de `ModeloDePolitica`
+        if not isinstance(ModeloDePolitica(), pomdp_py.Policy):
+            logging.error(
+                "[ERROR] 'ModeloDePolitica' no es una política válida.")
+            return
+
+        # 🔹 Configuración del planificador POUCT
+        try:
+            pouct = pomdp_py.POUCT(
+                max_depth=5,
+                discount_factor=0.95,
+                num_sims=100,
+                exploration_const=1.0,
+                rollout_policy=ModeloDePolitica()
+            )
+            logging.debug(f"[DEBUG] Planificador POUCT configurado: {pouct}")
+        except Exception as e:
+            logging.error(f"[ERROR] Fallo en la configuración de POUCT: {e}")
+            return
+
+        # 🔹 Creación del entorno
+        try:
+            estados_posibles = [estado_inicial]
+            entorno = EntornoConfort(
+                estados=estados_posibles, estado_inicial=estado_inicial)
+            logging.debug(f"[DEBUG] Entorno creado correctamente: {entorno}")
+        except Exception as e:
+            logging.error(f"[ERROR] Fallo en la creación del entorno: {e}")
+            return
+
+        if not isinstance(entorno, pomdp_py.Environment):
+            logging.error(
+                "[ERROR] 'entorno' no es una instancia válida de pomdp_py.Environment.")
+            return
+
+        # 🔹 Prueba de planificación con POUCT
+        try:
+            accion = pouct.plan(entorno)
+            logging.debug(
+                f"[DEBUG] Acción seleccionada por el planificador: {accion}")
+        except Exception as e:
+            logging.error(f"[ERROR] Fallo en la planificación con POUCT: {e}")
+            return
+
+    except Exception as e:
+        logging.error(
+            "[ERROR] Ocurrió un error durante la prueba básica:", exc_info=True)
+        traceback.print_exc()
+
+    logging.info("[INFO] Prueba básica completada.")
+
+
+class ProblemaConfortTermico(pomdp_py.POMDP):
+    """Clase que encapsula el modelo POMDP de confort térmico."""
+
+    def __init__(self, agente, entorno):
+        """Inicializa el problema asegurando que el agente y entorno sean válidos."""
+        if not isinstance(agente, AgentePersonalizado):
+            raise ValueError(
+                "[ERROR] 'agente' debe ser una instancia de AgentePersonalizado.")
+        if not isinstance(entorno, EntornoConfort):
+            raise ValueError(
+                "[ERROR] 'entorno' debe ser una instancia de EntornoConfort.")
+
+        super().__init__(agente, entorno)
+        self.agente = agente
+        self.entorno = entorno
+
+        logging.info(
+            "[INFO] ProblemaConfortTermico inicializado correctamente.")
+
+    @staticmethod
+    def crear(ruido_observacion, pmv_deseado, num_particulas=1000, num_estados=50):
+        """Método para crear un ProblemaConfortTermico con configuraciones predefinidas."""
+        try:
+            logging.info(
+                "[INFO] Configurando el problema de confort térmico...")
+
+            creencia_inicial = crear_creencia_inicial_en_particulas(
+                num_particulas=num_particulas)
+            if not isinstance(creencia_inicial, pomdp_py.Particles):
+                raise ValueError("[ERROR] La creencia inicial no es válida.")
+
+            # 🔹 Instanciar modelos clave
+            policy_model = ModeloDePolitica(pmv_deseado=pmv_deseado)
+            transition_model = ModeloDeTransicion()
+            observation_model = ModeloDeObservacion(
+                ruido_observacion=ruido_observacion)
+            reward_model = ModeloDeRecompensa(pmv_deseado=pmv_deseado)
+
+            # 🔹 Configurar el agente
+            agente = AgentePersonalizado(
+                nombre="AgenteConfortTermico",
+                pmv=pmv_deseado,
+                belief=creencia_inicial,
+                policy=policy_model,
+                transition_model=transition_model,
+                observation_model=observation_model,
+                reward_model=reward_model
+            )
+            logging.info("[INFO] Agente configurado con éxito.")
+
+            # 🔹 Configurar el entorno con múltiples estados posibles
+            estados_posibles = [
+                EstadoConfortTermico.generar_estado_aleatorio() for _ in range(num_estados)]
+            estado_inicial = estados_posibles[np.random.randint(
+                0, len(estados_posibles))]
+
+            entorno = EntornoConfort(
+                estados=estados_posibles, estado_inicial=estado_inicial)
+            logging.info("[INFO] Entorno configurado con éxito.")
+
+            problema = ProblemaConfortTermico(agente, entorno)
+            logging.info("[INFO] ProblemaConfortTermico creado con éxito.")
+
+            return problema
+
+        except Exception as e:
+            logging.error(
+                "[ERROR] Ocurrió un error durante la creación del problema:", exc_info=True)
+            traceback.print_exc()
+            raise e
+
+
+def safe_plan_call(planificador, agente):
+    """Realiza una llamada segura a `plan()`, asegurando una creencia válida y ajustando partículas si es necesario."""
+
+    logging.info(
+        "[DEBUG] Verificando agente y planificador antes de ejecutar plan()...")
+
+    # 🔹 Validar que `agente` tenga las propiedades necesarias
+    if not hasattr(agente, "cur_belief") or not hasattr(agente, "policy"):
+        logging.error(
+            "[ERROR] El objeto agente no contiene las propiedades necesarias (cur_belief, policy).")
+        return AccionConfortTermico(cambio_de_temperatura=0, cambio_de_flujo_de_aire=0)
+
+    logging.debug(f"[DEBUG] Tipo de creencia del agente: {
+                  type(agente.cur_belief)}")
+
+    # 🔹 Manejo de partículas inválidas o vacías
+    if not agente.cur_belief.particles:
+        logging.warning(
+            "[WARNING] `belief.particles` está vacío, generando partículas de respaldo...")
+        agente.set_belief(pomdp_py.Particles([
+            Particula(EstadoConfortTermico.generar_estado_aleatorio(), weight=1.0)
+        ]))
+
+    particulas_seguras = [
+        p for p in agente.cur_belief.particles if isinstance(p, Particula)]
+
+    if not particulas_seguras:
+        logging.warning(
+            "[WARNING] No hay partículas válidas después del filtrado. Se generará una de respaldo.")
+        particulas_seguras.append(
+            Particula(EstadoConfortTermico.generar_estado_aleatorio(), weight=1.0))
+
+    # 🔹 Ajuste de pesos en partículas
+    peso_total = sum(p.weight for p in particulas_seguras) or 1.0
+    for p in particulas_seguras:
+        p.weight = max(0.01, min(p.weight / peso_total, 1.5))
+
+    # 🔹 Conversión y actualización de creencia con `deepcopy()` para evitar conflictos de iteración
+    state_list = convert_belief_to_state_list(
+        pomdp_py.Particles(particulas_seguras))
+    agente.set_belief(pomdp_py.Particles(copy.deepcopy(state_list)))
+    agente.cur_belief_states = copy.deepcopy(state_list)
+
+    logging.debug(f"[DEBUG] Tamaño de belief.particles después de asignación: {
+                  len(agente.cur_belief.particles)}")
+
+    # 🔹 Confirmación de estado de partículas antes de ejecutar planificación
+    for idx, s in enumerate(agente.cur_belief.particles[:5]):
+        logging.info(f"[DEBUG] Partícula {idx}: Tipo: {
+                     type(s)}, contenido: {s}")
+
+    # 🔹 Validación del método de planificación en POUCT
+    logging.debug(f"[DEBUG] ¿Planificador POUCT tiene método de búsqueda?: {
+                  'plan' in dir(planificador)}")
+
+    try:
+        resultado = planificador.plan(agente)
+        if resultado is None:
+            raise ValueError("[ERROR] El planificador devolvió None.")
+    except Exception as e:
+        logging.warning(f"[WARNING] Se produjo una excepción en `plan()`: {e}")
+        return AccionConfortTermico(cambio_de_temperatura=0, cambio_de_flujo_de_aire=0)
+
+    logging.info(f"[DEBUG] Acción planificada con éxito: {resultado}")
+    return resultado
+
+
+def probar_planificador_con_arbol(problema_confort, planificador, pasos=5):
+    """Ejecuta una prueba del planificador con árbol de búsqueda si está disponible, validando la estabilidad de actualización."""
+
+    logging.info(f"[DEBUG] Probando planificador {
+                 type(planificador).__name__} con árbol de búsqueda...")
+
+    # 🔹 Verificar si el planificador tiene un árbol de búsqueda
+    tiene_arbol = hasattr(
+        planificador, 'tree') and planificador.tree is not None
+    logging.info(f"[DEBUG] ¿Planificador tiene árbol?: {tiene_arbol}")
+
+    if tiene_arbol:
+        try:
+            logging.debug(
+                "[DEBUG] ** Inspeccionando el árbol con TreeDebugger **")
+            debugger = TreeDebugger(planificador.tree)
+            debugger.display(width=80)
+        except Exception as e:
+            logging.error(
+                f"[ERROR] Fallo al inspeccionar el árbol con TreeDebugger: {e}")
+
+    # 🔹 Primera acción planificada
+    accion = safe_plan_call(planificador, problema_confort.agente)
+
+    for i in tqdm(range(pasos), desc="Ejecutando simulación"):
+        logging.info(f"\n[DEBUG] === Paso {i+1} ===")
+
+        try:
+            # 🔹 Obtener observación real desde el entorno
+            observacion_real = problema_confort.agente.observation_model.sample(
+                problema_confort.entorno.estado_inicial, accion
+            )
+
+            # 🔹 Actualizar creencias con resampleo
+            update_belief_with_resample(
+                problema_confort.agente, accion, observacion_real)
+
+            # 🔹 Actualizar el árbol del planificador
+            planificador.update(problema_confort.agente,
+                                accion, observacion_real)
+
+        except Exception as e:
+            logging.error(
+                f"[ERROR] Fallo en la actualización durante la simulación: {e}")
+
+        # 🔹 Obtener nueva acción planificada
+        accion = safe_plan_call(planificador, problema_confort.agente)
+
+    logging.info("[INFO] Simulación de planificación con árbol completada.")
+
+
+def main():
+    """Ejecuta la simulación del problema de confort térmico con validaciones avanzadas."""
+
+    logging.info(
+        "[INFO] Iniciando la simulación del problema de confort térmico.")
+
+    try:
+        # 🔹 Creación del problema POMDP
+        confort = ProblemaConfortTermico.crear(
+            ruido_observacion=0.15, pmv_deseado=0.0)
+
+        if not isinstance(confort, ProblemaConfortTermico):
+            raise ValueError(
+                "[ERROR] No se generó una instancia válida de ProblemaConfortTermico.")
+
+        if not hasattr(confort, "agente") or not hasattr(confort.agente, "policy"):
+            raise AttributeError(
+                "[ERROR] El problema generado no tiene un agente válido o su política.")
+
+    except Exception as e:
+        logging.error(
+            "[ERROR] Ocurrió un error al crear el problema de confort térmico:", exc_info=True)
+        traceback.print_exc()
+        return
+
+    # 🔹 Validación de la creencia inicial
+    if hasattr(confort.agente, 'get_belief'):
+        belief_inicial = confort.agente.get_belief()
+        logging.info(f"[DEBUG] Belief inicial: {belief_inicial}")
+
+    # 🔹 Inicialización de los planificadores
+    try:
+        planificadores = {
+            "POUCT": pomdp_py.POUCT(
+                max_depth=20,
+                discount_factor=0.95,
+                num_sims=5000,
+                exploration_const=1.2,
+                rollout_policy=confort.agente.policy
+            ),
+            "POMCP": pomdp_py.POMCP(
+                max_depth=20,
+                discount_factor=0.95,
+                num_sims=5000,
+                exploration_const=1.2,
+                rollout_policy=confort.agente.policy
+            )
+        }
+
+    except Exception as e:
+        logging.error(
+            "[ERROR] Falló la inicialización de los planificadores:", exc_info=True)
+        return
+
+    # 🔹 Ejecución de pruebas con cada planificador
+    for nombre, planificador in planificadores.items():
+        try:
+            logging.info(
+                f"\n[INFO] ** Prueba de {nombre} con análisis de árbol **")
+            logging.info(f"[DEBUG] Iniciando prueba para {nombre}")
+
+            tiene_arbol = hasattr(
+                planificador, 'tree') and planificador.tree is not None
+            logging.info(f"[DEBUG] ¿Planificador {
+                         nombre} tiene árbol?: {tiene_arbol}")
+
+            # Validación de belief antes de ejecutar el planificador
+            if hasattr(confort.agente, 'get_belief'):
+                belief_antes = confort.agente.get_belief()
+                logging.debug(
+                    f"[{nombre}] Belief antes de planificar: {belief_antes}")
+
+            probar_planificador_con_arbol(confort, planificador, pasos=5)
+
+            # Validación de belief después de ejecutar el planificador
+            if hasattr(confort.agente, 'get_belief'):
+                belief_despues = confort.agente.get_belief()
+                logging.debug(f"[{nombre}] Belief después de planificar: {
+                              belief_despues}")
+
+        except Exception as e:
+            logging.error(f"[ERROR] Falló la prueba del planificador {
+                          nombre}:", exc_info=True)
+
+    logging.info("[INFO] Simulación finalizada con éxito.")
+
+
+if __name__ == "__main__":
+    logging.info("[INFO] Ejecutando la simulación principal...")
+    logging.basicConfig(level=logging.DEBUG)
+    main()
