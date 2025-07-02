@@ -1428,7 +1428,7 @@ class PlanificadorPOUCT_VF(pomdp_py.POUCT):
         for acc in acciones_exploradas:
             conteo[acc] += 1
 
-        logging.info(f"[🔍] Total de nodos en raíz: {total}")
+        logging.info(f"[ojo] Total de nodos en raíz: {total}")
         for acc, n in sorted(conteo.items(), key=lambda x: x[1], reverse=True):
             porcentaje = (n / total) * 100
             logging.info(f"↳ Acción={acc} aparece en {n} nodos ({porcentaje:.1f}%)")
